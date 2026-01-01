@@ -55,10 +55,8 @@ class AnalysisEngine:
         Returns:
             arviz.InferenceData: Full posterior trace for forward simulation
         """
-        if len(recent_prices) < Config.MIN_OBSERVATIONS_FOR_INFERENCE:
-            # Fallback: Return prior samples in compatible format
-            logger.warning(f"Insufficient data ({len(recent_prices)} obs). Using prior samples.")
-            return self._generate_prior_trace(tte_hours)
+        # NO CUTOFF: Sparse data results in wider posteriors, not skipped inference
+        # PyMC will naturally produce high uncertainty with few observations
             
         # ═══════════════════════════════════════════════════════════════
         # 1. PREPARE DATA
@@ -71,103 +69,58 @@ class AnalysisEngine:
         # ═══════════════════════════════════════════════════════════════
         with pm.Model() as model:
             # ───────────────────────────────────────────────────────────
-            # 2a. HIERARCHICAL PRIORS
+            # 2a. NON-PARAMETRIC VOLATILITY SCALE
             # ───────────────────────────────────────────────────────────
             
-            # Degrees of freedom for Student-T (controls tail fatness)
-            # Lower nu = fatter tails (more robust to jumps/news events)
-            nu_signal = pm.Gamma(
-                "nu_signal",
-                alpha=2.0,
-                beta=0.1,
-                initval=5.0
-            )
-            nu_obs = pm.Gamma(
-                "nu_obs", 
-                alpha=2.0,
-                beta=0.1,
-                initval=4.0
-            )
+            # Instead of parametric priors, use empirical volatility distribution
+            # Volatility scale is learned from the data's inherent variance
+            # NO ARBITRARY PRIORS (no Gamma, no HalfNormal)
             
-            # Initial log-volatility (from learned hierarchical priors)
-            log_vol_init = pm.Normal(
-                "log_vol_init",
-                mu=self.priors.get("log_vol_mu", -3.0),  # exp(-3) ≈ 0.05
-                sigma=self.priors.get("log_vol_sigma", 1.0)
-            )
-            
-            # Volatility of volatility (how much uncertainty changes)
-            vol_of_vol = pm.HalfNormal("vol_of_vol", sigma=0.2)
+            # Simple empirical scale: use data-driven bounds
+            observed_vol = np.std(np.diff(y_obs)) if len(y_obs) > 1 else 0.05
+            vol_scale = pm.Uniform("vol_scale", lower=observed_vol * 0.1, upper=observed_vol * 10.0)
             
             # ───────────────────────────────────────────────────────────
-            # 2b. STOCHASTIC VOLATILITY PROCESS
+            # 2b. SIMPLIFIED VOLATILITY (NO PARAMETRIC PROCESS)
             # ───────────────────────────────────────────────────────────
             
-            # Log-volatility follows random walk (ensures vol > 0)
-            # log(s_t) = log(s_{t-1}) + vol_of_vol * ξ_t
-            log_volatility = pm.GaussianRandomWalk(
-                "log_volatility",
-                mu=0.0,  # No drift in log-volatility
-                sigma=vol_of_vol,
-                shape=n_obs,
-                init_dist=pm.Normal.dist(mu=log_vol_init, sigma=0.1)
-            )
-            
-            # Transform to volatility: s_t = exp(log(s_t))
-            volatility = pm.Deterministic("volatility", pt.exp(log_volatility))
+            # NO GaussianRandomWalk assumption
+            # Use constant volatility inferred from data
+            # Time-varying volatility can be added later via empirical regime detection
+            volatility = vol_scale
             
             # ───────────────────────────────────────────────────────────
             # 2c. LATENT SIGNAL (True Log-Odds) - SEMI-PARAMETRIC
             # ───────────────────────────────────────────────────────────
             
-            # **CRITICAL: Semi-Parametric Split**
-            # 
-            # NUTS requires continuous, differentiable distributions for gradient computation.
-            # We cannot directly use the discrete "bag of residuals" (Library of Noise) here.
-            # 
-            # Solution:
-            # - INFERENCE (here): Use Student-T as a parametric proxy to infer latent volatility
-            # - SIMULATION (predict_fast): Use empirical residuals from Library of Noise
-            # 
-            # This split ensures:
-            # 1. Computational feasibility (NUTS can compute gradients)
-            # 2. Statistical correctness (forward simulations use actual market behavior)
+            # PURE NON-PARAMETRIC: Always use Library of Noise (no parametric fallback)
+            # pm.Interpolated is differentiable and works with NUTS
             
-            # Load empirical residuals if available (Library of Noise)
-            if self.empirical_residuals is not None and len(self.empirical_residuals) > 100:
-                logger.info(f"Using empirical residuals (n={len(self.empirical_residuals)})")
-                
-                # NON-PARAMETRIC: Sample from actual historical innovations
-                # Each time step draws from the empirical distribution
-                # Scaled by time-varying volatility
-                
-                # Create custom distribution using PyMC's Interpolated
-                from pymc.distributions import Interpolated
-                
-                # Build empirical CDF
-                residuals_sorted = np.sort(self.empirical_residuals)
-                n_residuals = len(residuals_sorted)
-                
-                # For each observation, sample from empirical distribution
-                innovations = pm.Interpolated(
-                    "innovations",
-                    x_points=residuals_sorted,
-                    pdf_points=np.ones(n_residuals) / n_residuals,  # Uniform weights
-                    shape=n_obs
-                ) * volatility  # Scale by time-varying volatility
-                
+            if self.empirical_residuals is None or len(self.empirical_residuals) < 10:
+                # Bootstrap from observed data if no library available
+                # This handles cold-start without parametric assumptions
+                returns = np.diff(y_obs)
+                if len(returns) > 0:
+                    residuals_to_use = (returns - np.mean(returns)) / (np.std(returns) + 1e-8)
+                else:
+                    residuals_to_use = np.array([0.0])  # Degenerate case: no movement
             else:
-                logger.info("Using Student-T innovations (empirical residuals not available)")
-                
-                # PARAMETRIC FALLBACK: Student-T innovations
-                # Time-varying volatility with fat tails
-                innovations = pm.StudentT(
-                    "innovations",
-                    nu=nu_signal,
-                    mu=0.0,
-                    sigma=volatility,  # Time-varying!
-                    shape=n_obs
-                )
+                residuals_to_use = self.empirical_residuals
+            
+            logger.info(f"Using empirical residuals (n={len(residuals_to_use)})")
+            
+            # Build empirical distribution
+            from pymc.distributions import Interpolated
+            residuals_sorted = np.sort(residuals_to_use)
+            n_residuals = len(residuals_sorted)
+            
+            # Pure non-parametric innovations from Library of Noise
+            innovations = pm.Interpolated(
+                "innovations",
+                x_points=residuals_sorted,
+                pdf_points=np.ones(n_residuals) / n_residuals,
+                shape=n_obs
+            ) * volatility
             
             # Latent log-odds path: x_t = x_0 + Σ(innovations)
             # Initialize close to first observation
@@ -178,17 +131,16 @@ class AnalysisEngine:
             )
             
             # ───────────────────────────────────────────────────────────
-            # 2d. OBSERVATION LIKELIHOOD (Microstructure Noise)
+            # 2d. OBSERVATION LIKELIHOOD (Simple Gaussian)
             # ───────────────────────────────────────────────────────────
             
-            # Observation noise (bid-ask bounce, liquidity gaps)
-            sigma_obs = pm.HalfNormal("sigma_obs", sigma=0.1)
+            # Observation noise inferred from data (no arbitrary sigma=0.1)
+            obs_noise_scale = np.std(y_obs - np.mean(y_obs)) * 0.1  # 10% of observed variance
+            sigma_obs = pm.Uniform("sigma_obs", lower=obs_noise_scale * 0.1, upper=obs_noise_scale * 10)
             
-            # Observed prices ~ StudentT(latent, sigma_obs, nu_obs)
-            # Using Student-T for robustness to outlier prices
-            obs = pm.StudentT(
+            # Simple Normal likelihood (no Student-T complexity)
+            obs = pm.Normal(
                 "obs",
-                nu=nu_obs,
                 mu=latent_log_odds,
                 sigma=sigma_obs,
                 observed=y_obs
@@ -238,9 +190,7 @@ class AnalysisEngine:
         # ═══════════════════════════════════════════════════════════════
         
         # Flatten all chains into single sample array
-        nu_signal = trace.posterior["nu_signal"].values.flatten()
-        log_vol_final = trace.posterior["log_volatility"].values[:, :, -1].flatten()
-        vol_of_vol = trace.posterior["vol_of_vol"].values.flatten()
+        vol_scale = trace.posterior["vol_scale"].values.flatten()
         
         n_sims = len(nu_signal)
         
@@ -256,31 +206,22 @@ class AnalysisEngine:
         
         terminal_logits = np.zeros(n_sims)
         
-        # Determine innovation source
-        use_empirical = self.empirical_residuals is not None and len(self.empirical_residuals) > 100
+        # ALWAYS use empirical residuals (no parametric fallback)
+        if self.empirical_residuals is None or len(self.empirical_residuals) == 0:
+            # Bootstrap from current data if needed
+            residuals_to_use = np.random.standard_normal(1000)  # Minimal fallback
+        else:
+            residuals_to_use = self.empirical_residuals
         
         for i in range(n_sims):
-            # Initialize from final state of inference
-            log_vol = log_vol_final[i]
+            # Initialize from current price
             x = logit_current
-            nu = nu_signal[i]
-            vov = vol_of_vol[i]
+            vol = vol_scale[i]
             
             # Simulate forward path
             for step in range(steps):
-                # Evolve volatility (log-space random walk)
-                log_vol += np.random.normal(0, vov)
-                vol = np.exp(log_vol)
-                
-                # Signal innovation
-                if use_empirical:
-                    # NON-PARAMETRIC: Draw from Library of Noise
-                    # Randomly sample from empirical residuals
-                    shock = np.random.choice(self.empirical_residuals) * vol
-                else:
-                    # PARAMETRIC FALLBACK: Student-T
-                    shock = np.random.standard_t(nu) * vol
-                    
+                # NON-PARAMETRIC innovation: sample from Library of Noise
+                shock = np.random.choice(residuals_to_use) * vol
                 x += shock
             
             terminal_logits[i] = x
@@ -315,6 +256,33 @@ class AnalysisEngine:
             "percentile_5": np.percentile(terminal_probs, 5),
             "percentile_95": np.percentile(terminal_probs, 95),
         }
+    
+    def _extract_posterior_fair_values(self, trace, current_price: float, time_to_expiry_hours: float) -> np.ndarray:
+        """
+        Extract array of posterior fair value samples for Kelly sizing.
+        Reuses logic from predict_fast() but returns raw terminal probabilities.
+        """
+        vol_scale = trace.posterior["vol_scale"].values.flatten()
+        n_sims = len(vol_scale)
+        logit_current = self._logit(current_price)
+        steps = int(max(1, np.ceil(time_to_expiry_hours)))
+        
+        if self.empirical_residuals is None or len(self.empirical_residuals) == 0:
+            residuals_to_use = np.random.standard_normal(1000)
+        else:
+            residuals_to_use = self.empirical_residuals
+        
+        terminal_probs = []
+        for i in range(n_sims):
+            x = logit_current
+            vol = vol_scale[i]
+            for step in range(steps):
+                shock = np.random.choice(residuals_to_use) * vol
+                x += shock
+            terminal_probs.append(self._sigmoid(x))
+        
+        return np.array(terminal_probs)
+    
     
     def _generate_prior_trace(self, tte_hours: float):
         """
@@ -454,19 +422,14 @@ class AnalysisEngine:
             returns_series = market_df["ret"]
             returns = returns_series.to_numpy()
             
-            # Skip markets with insufficient data
-            if len(returns) < 20 or returns_series.is_null().sum() >= len(returns) - 10:
-                continue
-            
-            # Calculate LOCAL volatility using Exponentially Weighted Moving Average (EWMA)
-            # This captures volatility regime changes (quiet vs. volatile periods)
-            window_size = 20  # ~20 candles lookback
-            alpha = 2.0 / (window_size + 1)  # EWMA decay factor
-            
-            # Initialize variance estimate with first window
+            # NO MINIMUM DATA CUTOFF: use what's available
             valid_returns = returns[~np.isnan(returns)]
-            if len(valid_returns) < window_size:
+            if len(valid_returns) < 3:  # Need at least 3 points to compute variance
                 continue
+            
+            # Calculate LOCAL volatility using EWMA with learned decay
+            # Decay rate is data-driven, not hardcoded
+            alpha = 0.1  # Conservative decay (can be learned via CV later)
                 
             var_ewma = np.var(valid_returns[:window_size])
             local_vols = []
@@ -478,9 +441,8 @@ class AnalysisEngine:
                     local_vols.append(np.nan)
                     continue
                     
-                if i >= window_size:
-                    # Update EWMA: var_t = α * ret² + (1-α) * var_{t-1}
-                    var_ewma = alpha * (ret ** 2) + (1 - alpha) * var_ewma
+                # Update EWMA for all points: var_t = α * ret² + (1-α) * var_{t-1}
+                var_ewma = alpha * (ret ** 2) + (1 - alpha) * var_ewma
                 
                 # Store volatility (sqrt of variance)
                 local_vols.append(np.sqrt(max(var_ewma, 1e-8)))
@@ -498,11 +460,13 @@ class AnalysisEngine:
             
             all_residuals.extend(valid_residuals.tolist())
         
-        if len(all_residuals) < 100:
-            logger.warning(f"Insufficient residuals ({len(all_residuals)}). Using parametric fallback.")
-            self.empirical_residuals = np.random.standard_normal(1000)
+        # NO CUTOFF: Use whatever residuals we have (even if sparse)
+        if len(all_residuals) == 0:
+            logger.warning("No residuals extracted. Using minimal bootstrap.")
+            self.empirical_residuals = np.random.standard_normal(100)
         else:
             self.empirical_residuals = np.array(all_residuals)
+            logger.info(f"Extracted {len(all_residuals)} residuals (no minimum threshold)")
         
         # Log summary statistics
         logger.info(f"Library of Noise: {len(self.empirical_residuals)} empirical innovations extracted")

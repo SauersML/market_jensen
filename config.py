@@ -17,13 +17,9 @@ class Config:
     PROD_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
     API_URL = DEMO_API_URL if ENV == Environment.DEMO else PROD_API_URL
 
-    # Scanner Settings
-    MIN_DAILY_VOLUME_USD = 1000  # Minimum average daily volume to consider a series
-    MIN_HISTORY_EVENTS = 10      # Minimum number of past settled events to calculate volatility
-
     # MCMC & Inference Settings
     MCMC_N_SIMULATIONS = 10000
-    INFERENCE_WINDOW_HOURS = 24 # Lookback for online inference
+    # NO HARD WINDOWS: Use continuous time weighting instead
     
     # NUTS Sampler Configuration
     NUTS_CHAINS = 4              # Parallel chains for convergence diagnostics
@@ -35,24 +31,19 @@ class Config:
     STUDENT_T_NU_MIN = 2.0       # Minimum degrees of freedom (fatter tails)
     STUDENT_T_NU_MAX = 30.0      # Maximum degrees of freedom (closer to Gaussian)
     
-    # Minimum observations required for full Bayesian inference
-    MIN_OBSERVATIONS_FOR_INFERENCE = 10
+    
+    # NO MINIMUM OBSERVATION CUTOFF: Sparse data → wider posteriors
     
     # Clipping for logit transform to avoid -inf/inf at boundaries
     MIN_PROBABILITY_CLIP = 0.001
     MAX_PROBABILITY_CLIP = 0.999
 
-    # Trading Thresholds
-    # Jensen's Gap: Difference between Fair Value and Market Price
-    JENSEN_GAP_THRESHOLD_CENTS = 2.0
+    # Trading: Pure EV-Based Execution
+    # NO GAP THRESHOLDS, NO SPREAD GATES - only positive EV
+    TAKER_FEE_RATE = 0.007  # 70 basis points (Kalshi's actual fee)
     
-    # Trading Costs & Risk Controls
-    TAKER_FEE_RATE = 0.007  # 70 basis points (Kalshi taker fee)
-    CONFIDENCE_MULTIPLIER = 1.5  # Conservative safety margin for spread
-
-    # Data & Volatility
-    MIN_VOLATILITY_DATA_POINTS = 50
-    MIN_DAILY_VOLUME_USD = 1000 # Contracts
+    # Kelly Criterion Safety
+    KELLY_FRACTION = 0.25  # Quarter-Kelly for risk management
 
     # API & Persistence
     # DEPRECATED: Use API_URL instead (auto-selects based on ENV)
@@ -62,9 +53,8 @@ class Config:
     # Batch API Configuration
     BATCH_CANDLESTICK_CHUNK_SIZE = 100  # API limit per request
 
-    # Trading Settings
-    MAX_POSITION_SIZE_PERCENT = 0.05
-    ORDER_SIZE_CONTRACTS = 1      # Default order size
+    # Trading Settings (Dynamic Kelly-based sizing)
+    MAX_POSITION_SIZE_PERCENT = 0.05  # Max 5% of bankroll per position
 
     # Paths
     DATA_DIR = Path("data")

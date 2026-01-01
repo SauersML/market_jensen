@@ -33,14 +33,52 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Failed to refresh account: {e}")
 
-    def calculate_kelly_size(self, ticker: str, edge: float, odds: float, bankroll: float) -> int:
+    def calculate_kelly_size(self, fair_value: float, market_price: float, 
+                               bankroll: float, posterior_samples: np.ndarray) -> int:
         """
-        Config-based sizing for MVP, cap at Max %
+        True Kelly Criterion with posterior uncertainty.
+        f* = E[Kelly(θ)] integrated over posterior distribution.
+        
+        Args:
+            fair_value: Posterior mean fair value
+            market_price: Current ask (for buy) or bid (for sell)
+            bankroll: Total available capital
+            posterior_samples: Array of posterior fair values from MCMC
         """
-        # Fraction of bankroll
-        max_amt = bankroll * Config.MAX_POSITION_SIZE_PERCENT
-        # Determine size...
-        return Config.ORDER_SIZE_CONTRACTS
+        # Kelly formula for binary outcomes: f = (p*b - q) / b
+        # where p = win probability, q = 1-p, b = odds
+        
+        kelly_fractions = []
+        for sample_fair in posterior_samples:
+            # Odds: how much you win per dollar risked
+            # For prediction market: if buying at X, winning pays (1 - X)
+            if market_price > 0.99 or market_price < 0.01:
+                continue  # Avoid division by zero
+                
+            # Win probability from this posterior sample
+            p = sample_fair
+            # Odds (payoff ratio)
+            b = (1.0 - market_price) / market_price
+            
+            # Kelly fraction
+            f_kelly = (b * p - (1 - p)) / b
+            kelly_fractions.append(max(0, f_kelly))  # No negative bets
+        
+        if len(kelly_fractions) == 0:
+            return 0
+            
+        # Expected Kelly over posterior uncertainty
+        f_star = np.mean(kelly_fractions)
+        
+        # Fractional Kelly for safety (quarter-Kelly = 0.25)
+        from config import Config
+        f_dampened = f_star * Config.KELLY_FRACTION
+        
+        # Convert to contract quantity
+        position_value = bankroll * f_dampened
+        contracts = int(position_value / market_price)
+        
+        return max(0, min(contracts, int(bankroll / market_price)))  # Cap at max affordable
 
 class Trader:
     """
@@ -55,11 +93,13 @@ class Trader:
         self.active_tickers = [] 
         self.running = False
         
-        # Split Loop State with Trajectory Validity
-        # {ticker: {'trace': InferenceData, 'timestamp': float, 'valid_until': float}}
+        
+        # Cache for posteriors with learned validity
         self.posterior_cache = {}
-        self.posterior_lock = asyncio.Lock() # Protect cache
-        self.TRAJECTORY_VALIDITY_MINUTES = 10  # Cache lifetime (volatility regime assumption)
+        self.posterior_lock = asyncio.Lock()
+        # NO HARDCODED VALIDITY: Learn from posterior vol_of_vol
+        # For now, use conservative 5 minutes (can be made dynamic later)
+        self.TRAJECTORY_VALIDITY_SECONDS = 300
         
         self.active_markets_meta = {} # {ticker: market_info_dict} for expiry etc.
         self.orderbooks = {} # {ticker: {'bids': SortedList, 'asks': SortedList}}
@@ -136,15 +176,8 @@ class Trader:
             else:
                 no_bid_price = yes_asks[0][0] / 100.0
             
-            ask_price = 1.0 - no_bid_price
-            
-            # Frozen orderbook detection (wide spread = illiquid)
-            spread = ask_price - bid_price
-            if spread > 0.20:  # 20 cents
-                logger.debug(f"{ticker}: Spread too wide ({spread:.2f}), skipping")
-                return
-            
             mid_price = (bid_price + ask_price) / 2.0
+            spread = ask_price - bid_price
             
             # ═══════════════════════════════════════════════════════════
             # 2. CHECK CACHED POSTERIOR VALIDITY
@@ -176,72 +209,58 @@ class Trader:
             if hours_left <= 0:
                 return  # Market closed
             
-            # ═══════════════════════════════════════════════════════════
-            # 4. CALCULATE JENSEN'S GAP
-            # ═══════════════════════════════════════════════════════════
             prediction = self.engine.predict_fast(mid_price, hours_left, posterior)
             fair_value = prediction["fair_value"]
+            gap_cents = prediction["gap_cents"]
+            
+            # Extract posterior samples for Kelly sizing
+            # We need the full distribution, not just the mean
+            posterior_samples = self.engine._extract_posterior_fair_values(posterior, mid_price, hours_left)
             
             # ═══════════════════════════════════════════════════════════
-            # 5. DECISION LOGIC - LIQUIDITY-AWARE EXECUTION
+            # 5. PURE NET EV DECISION (No Arbitrary Thresholds)
             # ═══════════════════════════════════════════════════════════
-            # Edge must beat: Spread + Fees + Confidence Buffer
-            #
-            # The critic's insight: Jensen's Gap is often small (cents).
-            # We must ensure the edge exceeds ALL transaction costs.
+            # Calculate Net EV = Expected Payoff - All Costs
+            # No magic numbers like "gap > 2 cents" or "spread < 20 cents"
             
+            # BUY opportunity
             buy_gap = fair_value - ask_price
-            sell_gap = bid_price - fair_value
-            
-            # Calculate effective costs for BUY side
             buy_fees = ask_price * Config.TAKER_FEE_RATE
-            buy_spread_cost = spread * Config.CONFIDENCE_MULTIPLIER
-            buy_effective_threshold = (
-                Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0 +
-                buy_fees +
-                buy_spread_cost
-            )
+            buy_net_ev = buy_gap - buy_fees  # No spread multiplier, no gap threshold
             
-            # Calculate effective costs for SELL side
+            # SELL opportunity  
+            sell_gap = bid_price - fair_value
             sell_fees = bid_price * Config.TAKER_FEE_RATE
-            sell_spread_cost = spread * Config.CONFIDENCE_MULTIPLIER
-            sell_effective_threshold = (
-                Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0 +
-                sell_fees +
-                sell_spread_cost
-            )
+            sell_net_ev = sell_gap - sell_fees
             
-            # BUY signal: Fair value exceeds ask PLUS all costs
-            if buy_gap > buy_effective_threshold:
-                net_edge = buy_gap - buy_effective_threshold
-                logger.info(
-                    f"BUY {ticker}: "
-                    f"Gross Gap={buy_gap*100:.2f}¢ "
-                    f"Costs={buy_effective_threshold*100:.2f}¢ (fees={buy_fees*100:.2f}¢, spread={buy_spread_cost*100:.2f}¢) "
-                    f"NET EDGE={net_edge*100:.2f}¢ | "
-                    f"Fair={fair_value:.4f} Ask={ask_price:.4f} TTE={hours_left:.1f}h"
-                )
+            # Execute if ANY positive EV exists (the fundamental economic condition)
+            if buy_net_ev > 0:
+                # Calculate Kelly size using full posterior
                 qty = self.order_manager.calculate_kelly_size(
-                    ticker, net_edge, 1.0, self.order_manager.balance
+                    fair_value, ask_price, self.order_manager.balance, posterior_samples
                 )
+                
                 if qty > 0:
+                    logger.info(
+                        f"BUY {ticker}: Net EV={buy_net_ev*100:.3f}¢ | "
+                        f"Fair={fair_value:.4f} Ask={ask_price:.4f} Spread={spread*100:.1f}¢ | "
+                        f"Kelly Qty={qty} TTE={hours_left:.1f}h"
+                    )
                     ask_cents = int(round(ask_price * 100))
                     await self.client.create_order(ticker, "buy", "yes", qty, ask_cents)
             
-            # SELL signal: Bid exceeds fair value PLUS all costs
-            elif sell_gap > sell_effective_threshold:
-                net_edge = sell_gap - sell_effective_threshold
-                logger.info(
-                    f"SELL {ticker}: "
-                    f"Gross Gap={sell_gap*100:.2f}¢ "
-                    f"Costs={sell_effective_threshold*100:.2f}¢ (fees={sell_fees*100:.2f}¢, spread={sell_spread_cost*100:.2f}¢) "
-                    f"NET EDGE={net_edge*100:.2f}¢ | "
-                    f"Fair={fair_value:.4f} Bid={bid_price:.4f} TTE={hours_left:.1f}h"
-                )
+            elif sell_net_ev > 0:
                 qty = self.order_manager.calculate_kelly_size(
-                    ticker, net_edge, 1.0, self.order_manager.balance
+                    1.0 - fair_value, 1.0 - bid_price, self.order_manager.balance, 
+                    1.0 - posterior_samples  # Complement for NO side
                 )
+                
                 if qty > 0:
+                    logger.info(
+                        f"SELL {ticker}: Net EV={sell_net_ev*100:.3f}¢ | "
+                        f"Fair={fair_value:.4f} Bid={bid_price:.4f} Spread={spread*100:.1f}¢ | "
+                        f"Kelly Qty={qty} TTE={hours_left:.1f}h"
+                    )
                     no_price_cents = int(round((1.0 - bid_price) * 100))
                     await self.client.create_order(ticker, "buy", "no", qty, no_price_cents)
 
@@ -258,10 +277,11 @@ class Trader:
         while self.running:
             try:
                 for ticker in self.active_tickers:
-                    # 1. Fetch History (Last 24h)
+                    # 1. Fetch History (Use all available recent data, not hard 24h cutoff)
                     now = datetime.now(timezone.utc)
                     end_ts = int(now.timestamp())
-                    start_ts = int((now - timedelta(hours=Config.INFERENCE_WINDOW_HOURS)).timestamp())
+                    # Fetch last 48 hours for enough data, but weight recent observations more
+                    start_ts = int((now - timedelta(hours=48)).timestamp())
                     
                     try:
                         # Get market metadata for TTE calculation
@@ -289,8 +309,9 @@ class Trader:
                         c_resp = await self.client.get_candlesticks(ticker, start_ts, end_ts, 60)
                         candles = c_resp.get("candlesticks", [])
                         
-                        if not candles or len(candles) < Config.MIN_OBSERVATIONS_FOR_INFERENCE:
-                            logger.debug(f"{ticker}: Insufficient candles ({len(candles)}), skipping")
+                        # NO MIN_OBSERVATIONS CUTOFF - let PyMC handle sparse data
+                        if not candles or len(candles) < 3:  # Need minimal data for variance
+                            logger.debug(f"{ticker}: Very sparse data ({len(candles)} candles)")
                             continue
                         
                         recent_prices = [c['c'] / 100.0 for c in candles]
@@ -303,7 +324,7 @@ class Trader:
                         
                         # 4. Update Cache with Validity Timestamp
                         current_time = time.time()
-                        valid_until = current_time + (self.TRAJECTORY_VALIDITY_MINUTES * 60)
+                        valid_until = current_time + self.TRAJECTORY_VALIDITY_SECONDS
                         
                         async with self.posterior_lock:
                             self.posterior_cache[ticker] = {
@@ -312,7 +333,7 @@ class Trader:
                                 'valid_until': valid_until
                             }
                             
-                        logger.info(f"Analyst: Updated Posterior for {ticker} (valid for {self.TRAJECTORY_VALIDITY_MINUTES}min)")
+                        logger.info(f"Analyst: Updated Posterior for {ticker} (valid for {self.TRAJECTORY_VALIDITY_SECONDS//60}min)")
                         
                     except Exception as e:
                         logger.error(f"Analyst Error {ticker}: {e}")
