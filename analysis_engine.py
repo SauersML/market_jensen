@@ -96,14 +96,15 @@ class AnalysisEngine:
             # PURE NON-PARAMETRIC: Always use Library of Noise (no parametric fallback)
             # pm.Interpolated is differentiable and works with NUTS
             
+            # NO FALLBACK: Must have empirical residuals from historical data
             if self.empirical_residuals is None or len(self.empirical_residuals) < 10:
-                # Bootstrap from observed data if no library available
-                # This handles cold-start without parametric assumptions
+                # Bootstrap from current observed data (cold-start)
                 returns = np.diff(y_obs)
-                if len(returns) > 0:
-                    residuals_to_use = (returns - np.mean(returns)) / (np.std(returns) + 1e-8)
-                else:
-                    residuals_to_use = np.array([0.0])  # Degenerate case: no movement
+                if len(returns) == 0:
+                    raise ValueError("Insufficient data: Cannot infer with < 2 observations")
+                # Use observed returns as residuals (standardized)
+                residuals_to_use = (returns - np.mean(returns)) / (np.std(returns) + 1e-8)
+                logger.warning(f"Cold-start: bootstrapping {len(residuals_to_use)} residuals from current data")
             else:
                 residuals_to_use = self.empirical_residuals
             
@@ -206,12 +207,11 @@ class AnalysisEngine:
         
         terminal_logits = np.zeros(n_sims)
         
-        # ALWAYS use empirical residuals (no parametric fallback)
+        # ALWAYS use empirical residuals (no synthetic fallback)
         if self.empirical_residuals is None or len(self.empirical_residuals) == 0:
-            # Bootstrap from current data if needed
-            residuals_to_use = np.random.standard_normal(1000)  # Minimal fallback
-        else:
-            residuals_to_use = self.empirical_residuals
+            raise ValueError("Cannot predict without empirical residuals. Run fit_historical_priors first.")
+        
+        residuals_to_use = self.empirical_residuals
         
         for i in range(n_sims):
             # Initialize from current price
@@ -268,9 +268,9 @@ class AnalysisEngine:
         steps = int(max(1, np.ceil(time_to_expiry_hours)))
         
         if self.empirical_residuals is None or len(self.empirical_residuals) == 0:
-            residuals_to_use = np.random.standard_normal(1000)
-        else:
-            residuals_to_use = self.empirical_residuals
+            raise ValueError("Cannot extract posterior samples without empirical residuals")
+        
+        residuals_to_use = self.empirical_residuals
         
         terminal_probs = []
         for i in range(n_sims):
@@ -369,18 +369,11 @@ class AnalysisEngine:
         # Filter markets with sufficient observations
         market_stats = market_stats.filter(pl.col("n_obs") >= 5)
         
-        if len(market_stats) < 5:
-            logger.warning(f"Insufficient markets ({len(market_stats)}). Using defaults.")
-            self.priors = {
-                "log_vol_mu": -3.0,    # exp(-3) ≈ 0.05
-                "log_vol_sigma": 1.0,
-                "drift_mu": 0.0,
-                "drift_sigma": 0.05,
-            }
-            self.empirical_residuals = np.random.standard_normal(1000)  # Fallback
-            joblib.dump(self.priors, Config.MODELS_DIR / "hierarchical_priors.pkl")
-            joblib.dump(self.empirical_residuals, Config.MODELS_DIR / "empirical_residuals.pkl")
-            return
+        if len(market_stats) < 3:
+            raise ValueError(
+                f"Insufficient historical markets ({len(market_stats)}). "
+                "Need at least 3 markets with sufficient data to build Library of Noise."
+            )
         
         # ═══════════════════════════════════════════════════════════════
         # 3. FIT GLOBAL DISTRIBUTION (Log-Normal for Volatility)
@@ -460,13 +453,15 @@ class AnalysisEngine:
             
             all_residuals.extend(valid_residuals.tolist())
         
-        # NO CUTOFF: Use whatever residuals we have (even if sparse)
+        # NO FALLBACK: Must extract real residuals from data
         if len(all_residuals) == 0:
-            logger.warning("No residuals extracted. Using minimal bootstrap.")
-            self.empirical_residuals = np.random.standard_normal(100)
-        else:
-            self.empirical_residuals = np.array(all_residuals)
-            logger.info(f"Extracted {len(all_residuals)} residuals (no minimum threshold)")
+            raise ValueError(
+                "Failed to extract any empirical residuals from historical data. "
+                "Check data quality and variance calculations."
+            )
+        
+        self.empirical_residuals = np.array(all_residuals)
+        logger.info(f"Extracted {len(all_residuals)} empirical residuals (Library of Noise built)")
         
         # Log summary statistics
         logger.info(f"Library of Noise: {len(self.empirical_residuals)} empirical innovations extracted")

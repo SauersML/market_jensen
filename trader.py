@@ -121,8 +121,9 @@ class Trader:
         """
         Fetch active markets, update metadata cache.
         """
-        # Example: Get markets for KXINX
-        resp = await self.client.get_markets(series_ticker="KXINX", status="open")
+        # Get markets for active series (series_ticker should be dynamically determined)
+        # This is a placeholder - actual series should come from scanner
+        resp = await self.client.get_markets(status="open")
         markets = resp.get("markets", [])
         
         self.active_tickers = []

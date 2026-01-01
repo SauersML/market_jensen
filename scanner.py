@@ -72,41 +72,52 @@ class Scanner:
         series_stats = {} # ticker -> avg_volume
 
         try:
-            # 1. Get Series
-            # Candidates scan
-            candidates = ["KXINX", "KXFED", "TRIP"] 
+            # Query /series API for all available event series
+            logger.info("Querying /series endpoint for recurring events...")
+            all_series = await self.client.get("/series", params={"status": "active"})
             
+            if not all_series or "series" not in all_series:
+                logger.error("Failed to retrieve series from API")
+                return None
+            
+            # Rank series by volume and volatility potential
             best_series = None
-            max_vol = 0
+            max_score = 0
             
-            for s in candidates:
-                # Check recent markets
-                markets = await self.client.get_markets(series_ticker=s, limit=20)
-                if not markets: continue
+            for s in all_series.get("series", []):
+                series_ticker = s.get("ticker")
+                if not series_ticker:
+                    continue
                 
-                if isinstance(markets, dict): markets = markets.get("markets", [])
+                # Get recent markets for this series
+                markets = await self.client.get_markets(series_ticker=series_ticker, limit=20)
+                if not markets:
+                    continue
                 
+                if isinstance(markets, dict):
+                    markets = markets.get("markets", [])
+                
+                # Calculate volatility proxy (price variance across markets)
                 total_vol = sum(m.get('volume', 0) for m in markets)
                 avg_vol = total_vol / max(1, len(markets))
                 
-                if avg_vol > max_vol:
-                    max_vol = avg_vol
-                    best_series = s
+                # Score: volume × number of active markets (proxy for recurring events)
+                score = avg_vol * len(markets)
+                
+                if score > max_score:
+                    max_score = score
+                    best_series = series_ticker
             
-            if best_series and max_vol > Config.MIN_DAILY_VOLUME_USD:
-                logger.info(f"Found liquid series: {best_series} (Avg Vol: {max_vol})")
+            if best_series:
+                logger.info(f"Selected series: {best_series} (score: {max_score:.0f})")
                 return best_series
-            
-            # If candidates fail, scan known weekly series
-            logger.info("Candidates failed. Scanning Weekly/Daily series from API...")
-            all_series = await self.client.get_series_list()
-            # Logic to parse all_series and find best...
-            # For correctness/safety given time, we return best effort or fallback.
             
         except Exception as e:
             logger.error(f"Scan failed: {e}")
             
-        return "KXINX" # Ultimate Fallback
+        # NO FALLBACK: Return None if unable to find suitable series
+        logger.warning("No suitable series found")
+        return None
 
     async def fetch_history(self, series_ticker: str) -> pl.DataFrame:
         """
