@@ -8,5 +8,9 @@ python-dateutil
 websockets
 aiohttp
 sortedcontainers
-pymc
-arviz
+pymc>=5.10.0
+arviz>=0.17.0
+numpyro>=0.13.0
+jax>=0.4.20
+jaxlib>=0.4.20
+numba

@@ -4,6 +4,7 @@ import numpy as np
 import polars as pl
 import pymc as pm
 import pytensor.tensor as pt
+import arviz as az
 import joblib
 from scipy import stats
 from typing import Dict, List, Optional, Tuple
@@ -36,116 +37,259 @@ class AnalysisEngine:
     def _sigmoid(self, x):
         return 1.0 / (1.0 + np.exp(-x))
 
-    async def infer_posterior(self, recent_prices: List[float], tte_hours: float) -> Dict[str, np.ndarray]:
+    async def infer_posterior(self, recent_prices: List[float], tte_hours: float):
         """
         Phase B: The Analyst (Slow Loop).
-        Infers the posterior distribution of latent parameters (Mu, Sigma) given recent history.
-        Uses State Space Model to separate Signal (Latent) from Noise (Microstructure).
+        Infers the posterior distribution of latent parameters via Full Bayes MCMC.
+        
+        Uses Stochastic Volatility Model to separate:
+        - Latent Signal (True Log-Odds with time-varying uncertainty)
+        - Observation Noise (Market microstructure)
+        
+        Returns:
+            arviz.InferenceData: Full posterior trace for forward simulation
         """
-        if len(recent_prices) < 10:
-            # Fallback to Priors
-            bucket = self._get_bucket(tte_hours)
-            prior = self.priors.get(bucket, self.priors.get("Short")) # Fallback
+        if len(recent_prices) < Config.MIN_OBSERVATIONS_FOR_INFERENCE:
+            # Fallback: Return prior samples in compatible format
+            logger.warning(f"Insufficient data ({len(recent_prices)} obs). Using prior samples.")
+            return self._generate_prior_trace(tte_hours)
             
-            n_sims = Config.MCMC_N_SIMULATIONS
-            return {
-                "mus": np.random.standard_t(prior["drift_nu"], n_sims) * prior["drift_sigma"] + prior["drift_mu"],
-                "sigmas": np.abs(np.random.standard_t(prior["vol_nu"], n_sims) * prior["vol_sigma"] + prior["vol_mu"])
-            }
-            
-        # 1. Prepare Data
-        # Logits of observed prices
+        # ═══════════════════════════════════════════════════════════════
+        # 1. PREPARE DATA
+        # ═══════════════════════════════════════════════════════════════
         y_obs = self._logit(np.array(recent_prices))
         n_obs = len(y_obs)
         
-        # Select Prior Bucket
-        bucket = self._get_bucket(tte_hours)
-        prior = self.priors.get(bucket, self.priors.get("Short"))
-        
-        # 2. PyMC State Space Model
-        # Latent Random Walk + Observation Noise
+        # ═══════════════════════════════════════════════════════════════
+        # 2. STOCHASTIC VOLATILITY MODEL (PyMC)
+        # ═══════════════════════════════════════════════════════════════
         with pm.Model() as model:
-            # 2a. Priors (Hierarchical, Stratified)
-            # Drift (Trend)
-            mu = pm.StudentT("mu", 
-                             nu=prior["drift_nu"], 
-                             mu=prior["drift_mu"], 
-                             sigma=prior["drift_sigma"])
+            # ───────────────────────────────────────────────────────────
+            # 2a. HIERARCHICAL PRIORS
+            # ───────────────────────────────────────────────────────────
             
-            # Process Volatility (True underlying uncertainty)
-            sigma_process = pm.Truncated("sigma_process", 
-                                 pm.StudentT.dist(nu=prior["vol_nu"], mu=prior["vol_mu"], sigma=prior["vol_sigma"]), 
-                                 lower=0.0001)
-                                 
-            # Microstructure Noise (Observation Noise)
-            # We assume this is small but exists. HalfNormal prior.
-            sigma_noise = pm.HalfNormal("sigma_noise", sigma=0.1)
+            # Degrees of freedom for Student-T (controls tail fatness)
+            # Lower nu = fatter tails (more robust to jumps/news events)
+            nu_signal = pm.Gamma(
+                "nu_signal",
+                alpha=2.0,
+                beta=0.1,
+                initval=5.0
+            )
+            nu_obs = pm.Gamma(
+                "nu_obs", 
+                alpha=2.0,
+                beta=0.1,
+                initval=4.0
+            )
             
-            # 2b. Latent Process (Gaussian Random Walk)
-            # x_t = x_{t-1} + mu + sigma_process * eps
-            # We use GaussianRandomWalk distribution.
-            # Shape is n_obs.
-            # Initial state x_0 roughly matches y_obs[0]
+            # Initial log-volatility (from learned hierarchical priors)
+            log_vol_init = pm.Normal(
+                "log_vol_init",
+                mu=self.priors.get("log_vol_mu", -3.0),  # exp(-3) ≈ 0.05
+                sigma=self.priors.get("log_vol_sigma", 1.0)
+            )
             
-            x_latent = pm.GaussianRandomWalk("x_latent", 
-                                             mu=mu, 
-                                             sigma=sigma_process, 
-                                             shape=n_obs,
-                                             init_dist=pm.Normal.dist(mu=y_obs[0], sigma=0.1))
+            # Volatility of volatility (how much uncertainty changes)
+            vol_of_vol = pm.HalfNormal("vol_of_vol", sigma=0.2)
             
-            # 2c. Likelihood
-            # Observed Logits ~ Normal(Latent Logits, Noise)
-            obs = pm.Normal("obs", mu=x_latent, sigma=sigma_noise, observed=y_obs)
+            # ───────────────────────────────────────────────────────────
+            # 2b. STOCHASTIC VOLATILITY PROCESS
+            # ───────────────────────────────────────────────────────────
             
-            # Inference: ADVI
-            # This is higher dimensional (x_latent has n_obs params).
-            # ADVI is crucial here.
-            approx = pm.fit(n=30000, method='advi', progressbar=False)
-            trace = approx.sample(Config.MCMC_N_SIMULATIONS)
+            # Log-volatility follows random walk (ensures vol > 0)
+            # log(s_t) = log(s_{t-1}) + vol_of_vol * ξ_t
+            log_volatility = pm.GaussianRandomWalk(
+                "log_volatility",
+                mu=0.0,  # No drift in log-volatility
+                sigma=vol_of_vol,
+                shape=n_obs,
+                init_dist=pm.Normal.dist(mu=log_vol_init, sigma=0.1)
+            )
             
-        return {
-            "mus": trace.posterior["mu"].values.flatten(),
-            "sigmas": trace.posterior["sigma_process"].values.flatten()
-        }
+            # Transform to volatility: s_t = exp(log(s_t))
+            volatility = pm.Deterministic("volatility", pt.exp(log_volatility))
+            
+            # ───────────────────────────────────────────────────────────
+            # 2c. LATENT SIGNAL (True Log-Odds)
+            # ───────────────────────────────────────────────────────────
+            
+            # Student-T innovations with TIME-VARYING volatility
+            # η_t ~ StudentT(nu_signal, 0, s_t)
+            # This is the KEY innovation: volatility changes over time!
+            innovations = pm.StudentT(
+                "innovations",
+                nu=nu_signal,
+                mu=0.0,
+                sigma=volatility,  # Time-varying!
+                shape=n_obs
+            )
+            
+            # Latent log-odds path: x_t = x_0 + Σ(innovations)
+            # Initialize close to first observation
+            x0 = pm.Normal("x0", mu=y_obs[0], sigma=0.5)
+            latent_log_odds = pm.Deterministic(
+                "latent_log_odds",
+                x0 + pt.cumsum(innovations)
+            )
+            
+            # ───────────────────────────────────────────────────────────
+            # 2d. OBSERVATION LIKELIHOOD (Microstructure Noise)
+            # ───────────────────────────────────────────────────────────
+            
+            # Observation noise (bid-ask bounce, liquidity gaps)
+            sigma_obs = pm.HalfNormal("sigma_obs", sigma=0.1)
+            
+            # Observed prices ~ StudentT(latent, sigma_obs, nu_obs)
+            # Using Student-T for robustness to outlier prices
+            obs = pm.StudentT(
+                "obs",
+                nu=nu_obs,
+                mu=latent_log_odds,
+                sigma=sigma_obs,
+                observed=y_obs
+            )
+            
+            # ───────────────────────────────────────────────────────────
+            # 2e. SAMPLING (NUTS with NumPyro/JAX backend)
+            # ───────────────────────────────────────────────────────────
+            
+            logger.info(f"Starting NUTS sampling ({Config.NUTS_CHAINS} chains × {Config.NUTS_DRAWS} draws)...")
+            
+            trace = pm.sample(
+                draws=Config.NUTS_DRAWS,
+                tune=Config.NUTS_TUNE,
+                chains=Config.NUTS_CHAINS,
+                target_accept=Config.NUTS_TARGET_ACCEPT,
+                nuts_sampler="numpyro",  # JAX acceleration
+                progressbar=False,
+                return_inferencedata=True,
+                random_seed=42
+            )
+            
+            logger.info("NUTS sampling complete.")
+            
+        return trace
 
-    def predict_fast(self, current_price: float, time_to_expiry_hours: float, posterior: Dict[str, np.ndarray]) -> float:
+    def predict_fast(self, current_price: float, time_to_expiry_hours: float, trace) -> Dict[str, float]:
         """
         Phase C: The Trader (Fast Loop).
-        Vectorized forward simulation of the LATENT PROCESS (Signal).
-        We do NOT add observation noise here because we want the True Fair Value.
-        """
-        mus = posterior["mus"]
-        sigmas = posterior["sigmas"]
+        Forward simulation from posterior samples with stochastic volatility.
         
-        n_sims = min(len(mus), len(sigmas), Config.MCMC_N_SIMULATIONS)
-        mus = mus[:n_sims]
-        sigmas = sigmas[:n_sims]
+        Calculates Jensen's Gap:
+        - Fair Value = E[Sigmoid(x_final)] (Bayesian expectation)
+        - Naive Price = Sigmoid(E[x_final]) (market assumption)
+        - Gap = Fair Value - Naive Price (the arbitrage opportunity)
         
-        return self._simulate_paths(current_price, time_to_expiry_hours, mus, sigmas)
-
-    def _simulate_paths(self, current_price, hours, mus, sigmas) -> float:
+        Args:
+            current_price: Current market mid price [0, 1]
+            time_to_expiry_hours: Hours until market closes
+            trace: arviz.InferenceData from infer_posterior
+            
+        Returns:
+            Dict with fair_value, naive_price, gap, and diagnostics
         """
-        Vectorized Random Walk (Latent Signal).
-        """
-        steps = int(max(1, np.ceil(hours)))
-        n_sims = len(mus)
+        # ═══════════════════════════════════════════════════════════════
+        # 1. EXTRACT POSTERIOR SAMPLES
+        # ═══════════════════════════════════════════════════════════════
+        
+        # Flatten all chains into single sample array
+        nu_signal = trace.posterior["nu_signal"].values.flatten()
+        log_vol_final = trace.posterior["log_volatility"].values[:, :, -1].flatten()
+        vol_of_vol = trace.posterior["vol_of_vol"].values.flatten()
+        
+        n_sims = len(nu_signal)
+        
+        # Current log-odds
         logit_current = self._logit(current_price)
         
-        # Latent Process Shocks
-        # Assuming Process is Gaussian (or StudentT if we matched fit).
-        # Model used GaussianRandomWalk. Let's use Normal.
-        # User requested Fat Tails possible, but GRW is Normal.
-        # Let's stick to Normal for the Process to match the PyMC model.
-        raw_shocks = np.random.normal(0, 1, size=(n_sims, steps))
+        # Number of steps to simulate forward (hourly granularity)
+        steps = int(max(1, np.ceil(time_to_expiry_hours)))
         
-        # Path
-        step_moves = mus[:, np.newaxis] + sigmas[:, np.newaxis] * raw_shocks
-        cumulative = np.cumsum(step_moves, axis=1)
-        terminal_logits = logit_current + cumulative[:, -1]
+        # ═══════════════════════════════════════════════════════════════
+        # 2. FORWARD SIMULATION (Stochastic Volatility Path)
+        # ═══════════════════════════════════════════════════════════════
         
-        # Transform & Mean
+        terminal_logits = np.zeros(n_sims)
+        
+        for i in range(n_sims):
+            # Initialize from final state of inference
+            log_vol = log_vol_final[i]
+            x = logit_current
+            nu = nu_signal[i]
+            vov = vol_of_vol[i]
+            
+            # Simulate forward path
+            for step in range(steps):
+                # Evolve volatility (log-space random walk)
+                log_vol += np.random.normal(0, vov)
+                vol = np.exp(log_vol)
+                
+                # Signal innovation (Student-T with time-varying vol)
+                shock = np.random.standard_t(nu) * vol
+                x += shock
+            
+            terminal_logits[i] = x
+        
+        # ═══════════════════════════════════════════════════════════════
+        # 3. JENSEN'S GAP CALCULATION
+        # ═══════════════════════════════════════════════════════════════
+        
+        # Transform to probabilities
         terminal_probs = self._sigmoid(terminal_logits)
-        return np.mean(terminal_probs)
+        
+        # FAIR VALUE: E[P(θ)] = Mean of transformed samples
+        # This is the "true" Bayesian expectation
+        fair_value = np.mean(terminal_probs)
+        
+        # NAIVE PRICE: P(E[θ]) = Transform of mean log-odds
+        # This is what the market typically prices
+        naive_price = self._sigmoid(np.mean(terminal_logits))
+        
+        # THE GAP: The arbitrage opportunity
+        # Positive gap = market underpriced (BUY signal)
+        # Negative gap = market overpriced (SELL signal)
+        gap = fair_value - naive_price
+        
+        return {
+            "fair_value": fair_value,
+            "naive_price": naive_price,
+            "gap": gap,
+            "gap_cents": gap * 100.0,
+            "median_prob": np.median(terminal_probs),
+            "std_prob": np.std(terminal_probs),
+            "percentile_5": np.percentile(terminal_probs, 5),
+            "percentile_95": np.percentile(terminal_probs, 95),
+        }
+    
+    def _generate_prior_trace(self, tte_hours: float):
+        """
+        Generate a mock trace using prior distributions when data is insufficient.
+        Returns an object compatible with predict_fast expectations.
+        """
+        import arviz as az
+        
+        n_draws = Config.NUTS_DRAWS
+        n_chains = Config.NUTS_CHAINS
+        
+        # Sample from hierarchical priors
+        log_vol_mu = self.priors.get("log_vol_mu", -3.0)
+        log_vol_sigma = self.priors.get("log_vol_sigma", 1.0)
+        
+        # Create mock posterior samples
+        nu_signal = np.random.gamma(2.0, 1.0/0.1, size=(n_chains, n_draws))
+        log_volatility_final = np.random.normal(log_vol_mu, log_vol_sigma, size=(n_chains, n_draws))
+        vol_of_vol = np.abs(np.random.normal(0, 0.2, size=(n_chains, n_draws)))
+        
+        # Create InferenceData structure
+        posterior_dict = {
+            "nu_signal": (["chain", "draw"], nu_signal),
+            "log_volatility": (["chain", "draw", "time"], log_volatility_final[:, :, np.newaxis]),
+            "vol_of_vol": (["chain", "draw"], vol_of_vol),
+        }
+        
+        return az.from_dict(posterior=posterior_dict)
+
 
     def _get_bucket(self, hours: float) -> str:
         if hours < 1.0: return "UltraShort"
@@ -155,78 +299,81 @@ class AnalysisEngine:
 
     def fit_historical_priors(self, historical_df: pl.DataFrame):
         """
-        Phase A: Learn TTE-Stratified Priors.
+        Phase A: Learn Hierarchical Priors (No Bucketing).
+        Fits a global distribution of volatility across all settled markets.
         """
-        logger.info("Phase A: Fitting Stratified Priors...")
+        logger.info("Phase A: Fitting Hierarchical Priors (Global Model)...")
         
-        # 1. Calc Parameter Estimates per Market
+        # ═══════════════════════════════════════════════════════════════
+        # 1. CALCULATE REALIZED VOLATILITY PER MARKET
+        # ═══════════════════════════════════════════════════════════════
+        
         df = historical_df.sort(["market_ticker", "timestamp"])
+        
+        # Transform prices to log-odds
         df = df.with_columns([
-            pl.col("price_normalized").map_elements(self._logit, return_dtype=pl.Float64).alias("logit"),
-            pl.col("time_remaining_hours")
+            pl.col("price_normalized").map_elements(
+                self._logit, return_dtype=pl.Float64
+            ).alias("logit"),
         ])
         
-        # We need to assign each MARKET to a bucket?
-        # A market evolves through buckets.
-        # But we want the volatility characteristic of that market *when it was in that bucket*?
-        # Or do we treat a market as a single entity?
-        # Volatility assumes constant parameter fitting.
-        # Let's fit (Drift, Vol) for each market *overall*, but classify the market by its *Mean TTE* or *Start TTE*?
-        # No, better: segment the time series of each market into TTE chunks and calc vol for each chunk.
-        # Complexity: 8.
-        # Simpler: Each market has a dominant TTE characteristic in the data we fetched?
-        # Let's iterate markets and compute (mu, sigma) *per TTE window*.
+        # Calculate returns (differences in log-odds)
+        df = df.with_columns([
+            pl.col("logit").diff().over("market_ticker").alias("ret")
+        ])
         
-        # For simplicity/robustness:
-        # We calculate (mu, sigma) for *segments* of history.
-        # But `agg` works on groups.
-        # Let's bin the *rows* by TTE first.
+        # ═══════════════════════════════════════════════════════════════
+        # 2. AGGREGATE PER-MARKET STATISTICS
+        # ═══════════════════════════════════════════════════════════════
         
-        buckets = {
-            "UltraShort": df.filter(pl.col("time_remaining_hours") < 1.0),
-            "Short": df.filter((pl.col("time_remaining_hours") >= 1.0) & (pl.col("time_remaining_hours") < 24.0)),
-            "Medium": df.filter((pl.col("time_remaining_hours") >= 24.0) & (pl.col("time_remaining_hours") < 168.0)),
-            "Long": df.filter(pl.col("time_remaining_hours") >= 168.0)
+        market_stats = df.group_by("market_ticker").agg([
+            pl.col("ret").std().alias("realized_vol"),
+            pl.col("ret").mean().alias("drift"),
+            pl.col("time_remaining_hours").mean().alias("avg_tte"),
+            pl.col("ret").count().alias("n_obs"),
+        ]).drop_nulls()
+        
+        # Filter markets with sufficient observations
+        market_stats = market_stats.filter(pl.col("n_obs") >= 5)
+        
+        if len(market_stats) < 5:
+            logger.warning(f"Insufficient markets ({len(market_stats)}). Using defaults.")
+            self.priors = {
+                "log_vol_mu": -3.0,    # exp(-3) ≈ 0.05
+                "log_vol_sigma": 1.0,
+                "drift_mu": 0.0,
+                "drift_sigma": 0.05,
+            }
+            joblib.dump(self.priors, Config.MODELS_DIR / "hierarchical_priors.pkl")
+            return
+        
+        # ═══════════════════════════════════════════════════════════════
+        # 3. FIT GLOBAL DISTRIBUTION (Log-Normal for Volatility)
+        # ═══════════════════════════════════════════════════════════════
+        
+        # Take log of volatility (for log-normal modeling)
+        realized_vols = market_stats["realized_vol"].to_numpy()
+        log_vols = np.log(realized_vols + 1e-6)  # Add epsilon for stability
+        
+        # Fit global distribution using simple moments
+        log_vol_mu = np.mean(log_vols)
+        log_vol_sigma = np.std(log_vols)
+        
+        # Drift statistics
+        drifts = market_stats["drift"].to_numpy()
+        drift_mu = np.mean(drifts)
+        drift_sigma = np.std(drifts)
+        
+        self.priors = {
+            "log_vol_mu": float(log_vol_mu),
+            "log_vol_sigma": float(log_vol_sigma),
+            "drift_mu": float(drift_mu),
+            "drift_sigma": float(drift_sigma),
         }
         
-        self.priors = {}
+        logger.info(f"Hierarchical Priors (Global): {self.priors}")
+        logger.info(f"  Median Volatility: {np.exp(log_vol_mu):.4f}")
+        logger.info(f"  Based on {len(market_stats)} markets")
         
-        for name, sub_df in buckets.items():
-            if sub_df.is_empty():
-                logger.warning(f"No data for bucket {name}. Using default.")
-                self.priors[name] = {"drift_nu": 5, "drift_mu": 0, "drift_sigma": 0.05, "vol_nu": 5, "vol_mu": 0.05, "vol_sigma": 0.05}
-                continue
-
-            # Calculate observed return stats per market within this bucket
-            sub_df = sub_df.with_columns([
-                pl.col("logit").diff().over("market_ticker").alias("ret")
-            ])
-            
-            aggs = sub_df.group_by("market_ticker").agg([
-                pl.col("ret").mean().alias("mu"),
-                pl.col("ret").std().alias("sigma")
-            ]).drop_nulls()
-            
-            mus = aggs["mu"].to_numpy()
-            sigmas = aggs["sigma"].to_numpy()
-            
-            if len(mus) < 5:
-                logger.warning(f"Insufficient markets for bucket {name}. Using default.")
-                self.priors[name] = {"drift_nu": 5, "drift_mu": 0, "drift_sigma": 0.05, "vol_nu": 5, "vol_mu": 0.05, "vol_sigma": 0.05}
-                continue
-
-            # Fit StudentT
-            try:
-                d_nu, d_mu, d_sigma = stats.t.fit(mus)
-                v_nu, v_mu, v_sigma = stats.t.fit(sigmas)
-                
-                self.priors[name] = {
-                    "drift_nu": d_nu, "drift_mu": d_mu, "drift_sigma": d_sigma,
-                    "vol_nu": v_nu, "vol_mu": v_mu, "vol_sigma": v_sigma
-                }
-                logger.info(f"Bucket {name} Priors: {self.priors[name]}")
-            except Exception as e:
-                logger.error(f"Fit failed for {name}: {e}")
-                self.priors[name] = {"drift_nu": 5, "drift_mu": 0, "drift_sigma": 0.05, "vol_nu": 5, "vol_mu": 0.05, "vol_sigma": 0.05}
-
         joblib.dump(self.priors, Config.MODELS_DIR / "hierarchical_priors.pkl")
+

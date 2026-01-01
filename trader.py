@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from typing import Dict, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser
 from kalshi_client import AsyncKalshiClient, KalshiWebSocket
 from analysis_engine import AnalysisEngine
@@ -136,69 +136,34 @@ class Trader:
                 # Let's wait for Analyst.
                 return
 
-            fair_value = self.engine.predict_fast(mid_price, hours_left, posterior)
+            # Predict with Full Bayes (returns dict with gap metrics)
+            prediction = self.engine.predict_fast(mid_price, hours_left, posterior)
+            fair_value = prediction["fair_value"]
+            gap_cents = prediction["gap_cents"]
             
-            # 4. Decision (Maker / Limit Orders)
-            # User Strategy: Limit Orders @ FairValue +/- Edge
-            # "If Fair Value > P_ask + Fees, BUY YES" (Take liquidity if arb exists?)
-            # "Limit Orders (Maker) placed at FairValue - Edge"
+            # 4. Decision Based on Jensen's Gap
+            # Gap > 0: Market underpriced (Fair Value > Naive Price)
+            # Gap < 0: Market overpriced (Fair Value < Naive Price)
             
-            edge = Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0
-            my_bid = fair_value - edge
+            edge_threshold = Config.JENSEN_GAP_THRESHOLD_CENTS
             
-            # Simplified Execution for "Maker" strategy:
-            # If my_bid > best_bid, I improve the bid.
-            # If my_bid >= best_ask, I take liquidity (Market/Limit Cross).
-            
-            # For this bot, let's try to capture value.
-            # If Fair >> Ask, we Buy at Ask (Take)
-            if fair_value > (best_ask/100.0) + edge:
+            # BUY signal: Gap is positive and significant
+            # Fair value exceeds market ask
+            if gap_cents > edge_threshold and fair_value > (best_ask/100.0):
                  # Aggressive take
-                 logger.info(f"TAKE: BUY YES {ticker} @ {best_ask} (Fair {fair_value:.2f})")
-                 qty = self.order_manager.calculate_kelly_size(ticker, fair_value - (best_ask/100.0), 1.0, self.order_manager.balance)
-                 if qty > 0:
-                     await self.client.create_order(ticker, "buy", "yes", qty, best_ask) # Limit at Ask = Take
+                logger.info(f"BUY {ticker}: Gap={gap_cents:.2f}¢ Fair={fair_value:.3f} Ask={best_ask}¢")
+                qty = self.order_manager.calculate_kelly_size(ticker, fair_value - (best_ask/100.0), 1.0, self.order_manager.balance)
+                if qty > 0:
+                    await self.client.create_order(ticker, "buy", "yes", qty, best_ask)
             
-            elif abs(fair_value - (best_bid/100.0)) > edge and (fair_value > best_bid/100.0):
-                 # Maker Bid
-                 # Place Limit at round(my_bid * 100)
-                 # Ensure we don't cross ask?
-                 price_cents = int(my_bid * 100)
-                 if price_cents >= best_ask: price_cents = best_ask - 1
-                 if price_cents <= best_bid: price_cents = best_bid + 1 # Improve
-                 
-                 logger.info(f"MAKE: BID YES {ticker} @ {price_cents} (Fair {fair_value:.2f})")
-                 # Logic for passive maker orders would involve cancelling old ones.
-                 # For MVP+ we just fire one.
-                 qty = 1 # Small size for maker probing
-                 await self.client.create_order(ticker, "buy", "yes", qty, price_cents)
-                    
-            elif fair_value < (best_bid/100.0) - edge:
-                # Value Sell Signal (Buy No)
-                # Note: Kalshi 'buy no' is equivalent to 'sell yes' sometimes, but API uses side='no'
-                logger.info(f"SIGNAL: BUY NO {ticker} @ {100-best_bid} (Fair {fair_value:.2f})")
-                # Price for NO is 100 - YES_BID? 
-                # Yes Bid 40 -> I sell Yes at 40. 
-                # Or I Buy No at 60.
-                # If I use side='no', price is the NO price.
-                # If YES Bid is 40, NO Ask is 60. 
-                # Wait, to BUY NO I hit NO Ask. NO Ask corresponds to YES Bid.
-                # YES Bid 40 means someone buys Yes at 40. I Sell Yes at 40.
-                # If I hold NO position, I am Long No. 
-                # Let's stick to explicit side.
-                
-                no_price = 100 - best_bid # The price I pay for NO
-                # Check Edge
-                # Fair(Yes) = 0.30. Yes Bid = 0.40.
-                # I Sell Yes at 0.40. Valued at 0.30. Profit 0.10.
-                # Or I Buy No at 0.60. Valued at 0.70. Profit 0.10.
-                
+            # SELL signal: Gap is negative and significant
+            # Fair value below market bid
+            elif gap_cents < -edge_threshold and fair_value < (best_bid/100.0):
+                logger.info(f"SELL {ticker}: Gap={gap_cents:.2f}¢ Fair={fair_value:.3f} Bid={best_bid}¢")
+                no_price = 100 - best_bid
                 qty = self.order_manager.calculate_kelly_size(ticker, (best_bid/100.0) - fair_value, 1.0, self.order_manager.balance)
                 if qty > 0:
-                    # To trade against YES Bid, I can "sell" "yes" or "buy" "no".
-                    # Usually "buy" "no" is clearer for inventory if we treat them separate.
                     resp = await self.client.create_order(ticker, "buy", "no", qty, no_price)
-                    logger.info(f"ORDER SENT: {resp}")
 
         except Exception as e:
             logger.error(f"Eval Error {ticker}: {e}")

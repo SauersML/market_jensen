@@ -24,9 +24,21 @@ class Config:
     # MCMC & Inference Settings
     MCMC_N_SIMULATIONS = 10000
     INFERENCE_WINDOW_HOURS = 24 # Lookback for online inference
-    MCMC_TUNE_STEPS = 500
-    # Clipping removed per user request (logic handles logits naturally, though we clip to avoid -inf/inf at boundaries of 0/1)
-    # We keep a tiny epsilon just for safe logit transform if needed locally.
+    
+    # NUTS Sampler Configuration
+    NUTS_CHAINS = 4              # Parallel chains for convergence diagnostics
+    NUTS_DRAWS = 2000            # Post-warmup samples per chain
+    NUTS_TUNE = 1000             # Warmup/tuning samples
+    NUTS_TARGET_ACCEPT = 0.90    # Higher = more accurate, slower (0.8-0.95 typical)
+    
+    # Student-T Distribution Configuration
+    STUDENT_T_NU_MIN = 2.0       # Minimum degrees of freedom (fatter tails)
+    STUDENT_T_NU_MAX = 30.0      # Maximum degrees of freedom (closer to Gaussian)
+    
+    # Minimum observations required for full Bayesian inference
+    MIN_OBSERVATIONS_FOR_INFERENCE = 10
+    
+    # Clipping for logit transform to avoid -inf/inf at boundaries
     MIN_PROBABILITY_CLIP = 0.001
     MAX_PROBABILITY_CLIP = 0.999
 
