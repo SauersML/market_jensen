@@ -14,19 +14,25 @@ logger = logging.getLogger(__name__)
 
 class AnalysisEngine:
     """
-    Phase 8: Full Bayesian Parameter Inference.
-    - Phase A: Offline Prior Fitting (Hierarchical).
-    - Phase B: Online Parameter Inference (ADVI).
+    Phase 8: Full Bayesian Parameter Inference with Non-Parametric Innovations.
+    - Phase A: Offline Prior Fitting + Library of Noise extraction.
+    - Phase B: Online Parameter Inference (NUTS with empirical residuals).
     - Phase C: Posterior Predictive Simulation (Jensen's Gap).
     """
     def __init__(self):
-        # Hyperparameters (Priors for Mu and Sigma)
-        # Default Weakly Informative if no history fit yet
+        # Hierarchical Priors (Global Distribution)
         self.priors = {
-            "drift_mu": 0.0, "drift_sigma": 0.05, "drift_nu": 5,
-            "vol_mu": 0.05, "vol_sigma": 0.05, "vol_nu": 5
+            "log_vol_mu": -3.0,    # exp(-3) ≈ 0.05
+            "log_vol_sigma": 1.0,
+            "drift_mu": 0.0,
+            "drift_sigma": 0.05,
         }
-        # Last inferred posterior traces for the Active Market
+        
+        # Library of Noise (Empirical Residuals)
+        # Standardized innovations from historical markets
+        self.empirical_residuals = None  # Will be np.array after fit_historical_priors
+        
+        # Last inferred posterior traces for Active Market
         self.current_posterior = None 
         
     def _logit(self, p):
@@ -111,19 +117,44 @@ class AnalysisEngine:
             volatility = pm.Deterministic("volatility", pt.exp(log_volatility))
             
             # ───────────────────────────────────────────────────────────
-            # 2c. LATENT SIGNAL (True Log-Odds)
+            # 2c. LATENT SIGNAL (True Log-Odds) - NON-PARAMETRIC
             # ───────────────────────────────────────────────────────────
             
-            # Student-T innovations with TIME-VARYING volatility
-            # η_t ~ StudentT(nu_signal, 0, s_t)
-            # This is the KEY innovation: volatility changes over time!
-            innovations = pm.StudentT(
-                "innovations",
-                nu=nu_signal,
-                mu=0.0,
-                sigma=volatility,  # Time-varying!
-                shape=n_obs
-            )
+            # Load empirical residuals if available (Library of Noise)
+            if self.empirical_residuals is not None and len(self.empirical_residuals) > 100:
+                logger.info(f"Using empirical residuals (n={len(self.empirical_residuals)})")
+                
+                # NON-PARAMETRIC: Sample from actual historical innovations
+                # Each time step draws from the empirical distribution
+                # Scaled by time-varying volatility
+                
+                # Create custom distribution using PyMC's Interpolated
+                from pymc.distributions import Interpolated
+                
+                # Build empirical CDF
+                residuals_sorted = np.sort(self.empirical_residuals)
+                n_residuals = len(residuals_sorted)
+                
+                # For each observation, sample from empirical distribution
+                innovations = pm.Interpolated(
+                    "innovations",
+                    x_points=residuals_sorted,
+                    pdf_points=np.ones(n_residuals) / n_residuals,  # Uniform weights
+                    shape=n_obs
+                ) * volatility  # Scale by time-varying volatility
+                
+            else:
+                logger.info("Using Student-T innovations (empirical residuals not available)")
+                
+                # PARAMETRIC FALLBACK: Student-T innovations
+                # Time-varying volatility with fat tails
+                innovations = pm.StudentT(
+                    "innovations",
+                    nu=nu_signal,
+                    mu=0.0,
+                    sigma=volatility,  # Time-varying!
+                    shape=n_obs
+                )
             
             # Latent log-odds path: x_t = x_0 + Σ(innovations)
             # Initialize close to first observation
@@ -212,6 +243,9 @@ class AnalysisEngine:
         
         terminal_logits = np.zeros(n_sims)
         
+        # Determine innovation source
+        use_empirical = self.empirical_residuals is not None and len(self.empirical_residuals) > 100
+        
         for i in range(n_sims):
             # Initialize from final state of inference
             log_vol = log_vol_final[i]
@@ -225,8 +259,15 @@ class AnalysisEngine:
                 log_vol += np.random.normal(0, vov)
                 vol = np.exp(log_vol)
                 
-                # Signal innovation (Student-T with time-varying vol)
-                shock = np.random.standard_t(nu) * vol
+                # Signal innovation
+                if use_empirical:
+                    # NON-PARAMETRIC: Draw from Library of Noise
+                    # Randomly sample from empirical residuals
+                    shock = np.random.choice(self.empirical_residuals) * vol
+                else:
+                    # PARAMETRIC FALLBACK: Student-T
+                    shock = np.random.standard_t(nu) * vol
+                    
                 x += shock
             
             terminal_logits[i] = x
@@ -307,10 +348,13 @@ class AnalysisEngine:
 
     def fit_historical_priors(self, historical_df: pl.DataFrame):
         """
-        Phase A: Learn Hierarchical Priors (No Bucketing).
-        Fits a global distribution of volatility across all settled markets.
+        Phase A: Learn Hierarchical Priors + Extract Library of Noise.
+        
+        Extracts:
+        1. Global volatility distribution (hierarchical priors)
+        2. Empirical residuals (Library of Noise) for non-parametric innovations
         """
-        logger.info("Phase A: Fitting Hierarchical Priors (Global Model)...")
+        logger.info("Phase A: Fitting Hierarchical Priors + Extracting Library of Noise...")
         
         # ═══════════════════════════════════════════════════════════════
         # 1. CALCULATE REALIZED VOLATILITY PER MARKET
@@ -352,7 +396,9 @@ class AnalysisEngine:
                 "drift_mu": 0.0,
                 "drift_sigma": 0.05,
             }
+            self.empirical_residuals = np.random.standard_normal(1000)  # Fallback
             joblib.dump(self.priors, Config.MODELS_DIR / "hierarchical_priors.pkl")
+            joblib.dump(self.empirical_residuals, Config.MODELS_DIR / "empirical_residuals.pkl")
             return
         
         # ═══════════════════════════════════════════════════════════════
@@ -379,9 +425,49 @@ class AnalysisEngine:
             "drift_sigma": float(drift_sigma),
         }
         
+        # ═══════════════════════════════════════════════════════════════
+        # 4. EXTRACT LIBRARY OF NOISE (Empirical Residuals)
+        # ═══════════════════════════════════════════════════════════════
+        
+        logger.info("Extracting empirical residuals (Library of Noise)...")
+        
+        # Join market-level volatility back to dataframe
+        df = df.join(
+            market_stats.select(["market_ticker", "realized_vol"]),
+            on="market_ticker",
+            how="left"
+        )
+        
+        # Standardize residuals by local realized volatility
+        # standardized_residual = (return - drift) / realized_vol
+        df = df.with_columns([
+            ((pl.col("ret") - drift_mu) / pl.col("realized_vol")).alias("std_residual")
+        ])
+        
+        # Extract all standardized residuals (drop nulls from diff operation)
+        residuals = df.filter(
+            pl.col("std_residual").is_not_null() & 
+            pl.col("std_residual").is_finite()
+        )["std_residual"].to_numpy()
+        
+        # Store as empirical distribution
+        self.empirical_residuals = residuals
+        
+        logger.info(f"Library of Noise: {len(residuals)} empirical innovations extracted")
+        logger.info(f"  Mean: {np.mean(residuals):.4f}")
+        logger.info(f"  Std: {np.std(residuals):.4f}")
+        logger.info(f"  Skew: {float(pl.Series(residuals).skew()):.4f}")
+        logger.info(f"  [5%, 95%]: [{np.percentile(residuals, 5):.3f}, {np.percentile(residuals, 95):.3f}]")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # 5. SAVE
+        # ═══════════════════════════════════════════════════════════════
+        
         logger.info(f"Hierarchical Priors (Global): {self.priors}")
         logger.info(f"  Median Volatility: {np.exp(log_vol_mu):.4f}")
         logger.info(f"  Based on {len(market_stats)} markets")
         
         joblib.dump(self.priors, Config.MODELS_DIR / "hierarchical_priors.pkl")
+        joblib.dump(self.empirical_residuals, Config.MODELS_DIR / "empirical_residuals.pkl")
+
 
