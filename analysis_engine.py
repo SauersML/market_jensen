@@ -268,6 +268,7 @@ class AnalysisEngine:
         Returns an object compatible with predict_fast expectations.
         """
         import arviz as az
+        import xarray as xr
         
         n_draws = Config.NUTS_DRAWS
         n_chains = Config.NUTS_CHAINS
@@ -276,19 +277,26 @@ class AnalysisEngine:
         log_vol_mu = self.priors.get("log_vol_mu", -3.0)
         log_vol_sigma = self.priors.get("log_vol_sigma", 1.0)
         
-        # Create mock posterior samples
+        # Create mock posterior samples with consistent shapes
         nu_signal = np.random.gamma(2.0, 1.0/0.1, size=(n_chains, n_draws))
-        log_volatility_final = np.random.normal(log_vol_mu, log_vol_sigma, size=(n_chains, n_draws))
+        log_volatility_final = np.random.normal(log_vol_mu, log_vol_sigma, size=(n_chains, n_draws, 1))
         vol_of_vol = np.abs(np.random.normal(0, 0.2, size=(n_chains, n_draws)))
         
-        # Create InferenceData structure
-        posterior_dict = {
-            "nu_signal": (["chain", "draw"], nu_signal),
-            "log_volatility": (["chain", "draw", "time"], log_volatility_final[:, :, np.newaxis]),
-            "vol_of_vol": (["chain", "draw"], vol_of_vol),
-        }
+        # Create Dataset directly (more control)
+        posterior = xr.Dataset(
+            {
+                "nu_signal": (["chain", "draw"], nu_signal),
+                "log_volatility": (["chain", "draw", "time"], log_volatility_final),
+                "vol_of_vol": (["chain", "draw"], vol_of_vol),
+            },
+            coords={
+                "chain": np.arange(n_chains),
+                "draw": np.arange(n_draws),
+                "time": [0],  # Single time point (final state)
+            }
+        )
         
-        return az.from_dict(posterior=posterior_dict)
+        return az.InferenceData(posterior=posterior)
 
 
     def _get_bucket(self, hours: float) -> str:
