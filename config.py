@@ -12,9 +12,9 @@ class Config:
     KEY_ID = os.getenv("KALSHI_KEY_ID")
     KEY_FILE = os.getenv("KALSHI_KEY_FILE")
 
-    # API
-    DEMO_API_URL = "https://demo-api.kalshi.co"
-    PROD_API_URL = "https://api.elections.kalshi.com"
+    # API URLs (V2)
+    DEMO_API_URL = "https://demo-api.kalshi.co/trade-api/v2"
+    PROD_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
     API_URL = DEMO_API_URL if ENV == Environment.DEMO else PROD_API_URL
 
     # Scanner Settings
@@ -51,8 +51,12 @@ class Config:
     MIN_DAILY_VOLUME_USD = 1000 # Contracts
 
     # API & Persistence
-    BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
-    WS_BASE_URL = "wss://trading-api.kalshi.com/trade-api/v2/ws"
+    # DEPRECATED: Use API_URL instead (auto-selects based on ENV)
+    BASE_URL = API_URL
+    WS_BASE_URL = "wss://demo-api.kalshi.co/trade-api/v2/ws" if ENV == Environment.DEMO else "wss://api.elections.kalshi.com/trade-api/v2/ws"
+    
+    # Batch API Configuration
+    BATCH_CANDLESTICK_CHUNK_SIZE = 100  # API limit per request
 
     # Trading Settings
     MAX_POSITION_SIZE_PERCENT = 0.05

@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 class AsyncKalshiClient:
     def __init__(self, key_id: str=None, private_key_path: str=None):
         self.base_url = Config.BASE_URL
-        self.key_id = key_id or Config.KALSHI_KEY_ID
-        self.private_key_path = private_key_path or Config.KALSHI_KEY_FILE
+        self.key_id = key_id or Config.KEY_ID
+        self.private_key_path = private_key_path or Config.KEY_FILE
         self._load_private_key()
         self._session = None
 
@@ -72,9 +72,9 @@ class AsyncKalshiClient:
 
         headers = {
             "Content-Type": "application/json",
-            "KALSHI-API-KEY": self.key_id,
-            "KALSHI-API-SIGNATURE": signature,
-            "KALSHI-API-TIMESTAMP": timestamp
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp
         }
 
         url = f"{self.base_url}{path}"
@@ -134,24 +134,50 @@ class AsyncKalshiClient:
 
     async def batch_get_market_candlesticks(self, tickers: List[str], start_ts: int, end_ts: int, period: int) -> Dict:
         """
-        Fetches candlesticks for multiple markets concurrently using asyncio.gather.
-        Returns a dict {ticker: candles_list}.
-        """
-        tasks = []
-        for t in tickers:
-            tasks.append(self.get_candlesticks(t, start_ts, end_ts, period))
-            
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        Fetches candlesticks for multiple markets using the V2 batch endpoint.
+        API: GET /markets/candlesticks?market_tickers=TICKER1,TICKER2,...
+        Max 100 tickers per request (automatically chunks).
         
-        out = {}
-        for t, res in zip(tickers, results):
-            if isinstance(res, Exception):
-                logger.error(f"Failed to fetch candles for {t}: {res}")
-                out[t] = []
-            else:
-                out[t] = res.get("candlesticks", [])
+        Returns:
+            Dict with structure: {"candlesticks": {"TICKER1": [...], "TICKER2": [...]}}
+        """
+        from config import Config
+        
+        # Chunk tickers into groups of 100 (API limit)
+        chunk_size = getattr(Config, 'BATCH_CANDLESTICK_CHUNK_SIZE', 100)
+        chunks = [tickers[i:i+chunk_size] for i in range(0, len(tickers), chunk_size)]
+        
+        all_results = {}
+        
+        for chunk in chunks:
+            ticker_str = ",".join(chunk)
+            params = {
+                "market_tickers": ticker_str,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "period_interval": period
+            }
+            
+            try:
+                resp = await self._request("GET", "/markets/candlesticks", params=params)
                 
-        return {"candlesticks": out}
+                # API returns: {"markets": [{"market_ticker": "X", "candlesticks": [...]}, ...]}
+                markets_array = resp.get("markets", [])
+                for market_data in markets_array:
+                    ticker = market_data.get("market_ticker")
+                    candles = market_data.get("candlesticks", [])
+                    if ticker:
+                        all_results[ticker] = candles
+                
+            except Exception as e:
+                logger.error(f"Failed to fetch batch candles for chunk: {e}")
+                # Fill with empty arrays for failed tickers
+                for t in chunk:
+                    if t not in all_results:
+                        all_results[t] = []
+        
+        return {"candlesticks": all_results}
+
 
     async def get_candlesticks(self, ticker: str, start_ts: int, end_ts: int, period_interval: int) -> Dict:
         params = {
@@ -180,6 +206,28 @@ class AsyncKalshiClient:
         }
         return await self._request("POST", "/portfolio/orders", body=body)
 
+    def parse_price(self, price_data: Dict, side: str = "yes") -> float:
+        """
+        Extracts precise price from API response with sub-penny support.
+        Prefers 'yes_price_dollars'/'no_price_dollars' over integer cent fields.
+        
+        Args:
+            price_data: Dict with price fields from API
+            side: 'yes' or 'no'
+        
+        Returns:
+            Float price in [0.0, 1.0] range with sub-penny precision
+        """
+        dollar_key = f"{side}_price_dollars"
+        cent_key = f"{side}_price"
+        
+        if dollar_key in price_data:
+            return float(price_data[dollar_key])
+        elif cent_key in price_data:
+            return price_data[cent_key] / 100.0
+        else:
+            raise ValueError(f"No {side} price field found in {price_data}")
+
 
 class KalshiWebSocket:
     def __init__(self, client: AsyncKalshiClient, message_handler):
@@ -192,51 +240,46 @@ class KalshiWebSocket:
         self.subscriptions = set()
 
     async def connect(self):
+        """
+        V2 WebSocket Connection with Header-Based Authentication.
+        Auth headers must be passed during the HTTP handshake, not as a JSON frame.
+        """
         import websockets
         self.running = True
+        
         while self.running:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                # Generate auth headers for WebSocket handshake
+                ts = str(int(time.time() * 1000))
+                # Sign the WebSocket path
+                sig = self.client._sign_request("GET", "/trade-api/v2/ws", ts)
+                
+                auth_headers = {
+                    "KALSHI-ACCESS-KEY": self.client.key_id,
+                    "KALSHI-ACCESS-SIGNATURE": sig,
+                    "KALSHI-ACCESS-TIMESTAMP": ts
+                }
+                
+                # Connect with authentication headers in handshake
+                async with websockets.connect(
+                    self.ws_url, 
+                    additional_headers=auth_headers
+                ) as ws:
                     self.ws = ws
-                    logger.info("Connected to WebSocket")
+                    logger.info("WebSocket authenticated via handshake")
                     
-                    # Authenticate
-                    # V2 Auth: Send {"id": 1, "cmd": "login", "params": {...}}
-                    ts = str(int(time.time() * 1000))
-                    sig_path = "/trade-api/v2/ws/login" # Verify path usually just /ws/login or similar, but sig is on standard path
-                    # Actually standard is: method 'GET', path '/users/websocket/auth' usually for generating token 
-                    # OR internal signing.
-                    # Kalshi docs say: Sign "GET" + "/users/websocket/auth" + timestamp?
-                    # OR just sign the connect message?
-                    # Let's assume standard API signature on a 'login' command.
-                    
-                    # Sig on "/trade-api/v2/ws" ?? 
-                    # Let's use the explicit signature generation method from client.
-                    sig = self.client._sign_request("GET", "/users/websocket/auth", ts) 
-                    
-                    auth_msg = {
-                        "id": self.msg_id,
-                        "cmd": "login",
-                        "params": {
-                            "keyId": self.client.key_id,
-                            "signature": sig,
-                            "timestamp": ts
-                        }
-                    }
-                    await ws.send(json.dumps(auth_msg))
-                    self.msg_id += 1
-                    
-                    # Resubscribe if reconnecting
+                    # Resubscribe to tickers if reconnecting
                     if self.subscriptions:
                         await self.subscribe(list(self.subscriptions))
                     
+                    # Listen for messages
                     async for msg in ws:
                         data = json.loads(msg)
                         await self.handler(data)
                         
             except Exception as e:
                 logger.error(f"WebSocket Error: {e}")
-                await asyncio.sleep(5) # Backoff
+                await asyncio.sleep(5)  # Backoff before reconnect
 
     async def subscribe(self, tickers: List[str], channels=["orderbook_delta"]):
         if not self.ws:

@@ -54,9 +54,12 @@ class Trader:
         self.active_tickers = [] 
         self.running = False
         
-        # Split Loop State
-        self.posterior_cache = {} # {ticker: {'mus': [], 'sigmas': [], 'last_updated': ts}}
+        # Split Loop State with Trajectory Validity
+        # {ticker: {'trace': InferenceData, 'timestamp': float, 'valid_until': float}}
+        self.posterior_cache = {}
         self.posterior_lock = asyncio.Lock() # Protect cache
+        self.TRAJECTORY_VALIDITY_MINUTES = 10  # Cache lifetime (volatility regime assumption)
+        
         self.active_markets_meta = {} # {ticker: market_info_dict} for expiry etc.
         self.orderbooks = {} # {ticker: {'bids': SortedList, 'asks': SortedList}}
         
@@ -103,67 +106,121 @@ class Trader:
             await self.evaluate_ticker(ticker)
 
     async def evaluate_ticker(self, ticker: str):
+        """
+        Fast Loop: Evaluate arbitrage opportunity using cached posterior.
+        """
         try:
-            # 1. Get Price (from local book or fetch)
-            # For robustness, we fetch snapshot if book empty
+            # ═══════════════════════════════════════════════════════════
+            # 1. GET ORDERBOOK (Sub-Penny Precision)
+            # ═══════════════════════════════════════════════════════════
             ob_resp = await self.client.get_market_orderbook(ticker)
             ob = ob_resp.get("orderbook", {})
             yes_bids = ob.get("yes", [])
-            if not yes_bids: return
+            yes_asks = ob.get("no", [])  # No asks = complement of yes bids
             
-            best_bid = yes_bids[0][0]
-            # Synth ask
-            best_ask = 100 - ob.get("no", [[0,0]])[0][0]
-            mid_price = (best_bid + best_ask) / 2.0 / 100.0
+            if not yes_bids or not yes_asks:
+                return  # Illiquid market
             
-            # 2. Time to expiry (Principaled)
+            # Parse prices with sub-penny support
+            if isinstance(yes_bids[0], dict):
+                # V2 format with sub-penny
+                bid_price = self.client.parse_price(yes_bids[0], "yes")
+            else:
+                # Legacy format [price_cents, quantity]
+                bid_price = yes_bids[0][0] / 100.0
+            
+            # Ask = 1 - no_bid (complement)
+            if isinstance(yes_asks[0], dict):
+                no_bid_price = self.client.parse_price(yes_asks[0], "no")
+            else:
+                no_bid_price = yes_asks[0][0] / 100.0
+            
+            ask_price = 1.0 - no_bid_price
+            
+            # Frozen orderbook detection (wide spread = illiquid)
+            spread = ask_price - bid_price
+            if spread > 0.20:  # 20 cents
+                logger.debug(f"{ticker}: Spread too wide ({spread:.2f}), skipping")
+                return
+            
+            mid_price = (bid_price + ask_price) / 2.0
+            
+            # ═══════════════════════════════════════════════════════════
+            # 2. CHECK CACHED POSTERIOR VALIDITY
+            # ═══════════════════════════════════════════════════════════
+            posterior_data = self.posterior_cache.get(ticker)
+            if not posterior_data:
+                # No inference yet, wait for analyst
+                return
+            
+            # Staleness check
+            current_time = time.time()
+            if current_time > posterior_data.get('valid_until', 0):
+                logger.warning(f"{ticker}: Cached posterior expired, waiting for analyst...")
+                return
+            
+            posterior = posterior_data['trace']
+            
+            # ═══════════════════════════════════════════════════════════
+            # 3. TIME TO EXPIRY
+            # ═══════════════════════════════════════════════════════════
             meta = self.active_markets_meta.get(ticker)
-            if not meta: return 
+            if not meta:
+                return
             
             close_time = parser.isoparse(meta['close_time'])
             now = datetime.now(timezone.utc)
             hours_left = (close_time - now).total_seconds() / 3600.0
             
-            if hours_left <= 0: return
-
-            # 3. Fast Prediction (Using Cached Posteriors)
-            # The Analyst Loop updates the cache in background.
-            # Here we just read.
-            posterior = self.posterior_cache.get(ticker)
-            if not posterior:
-                # No inference yet, skip or use priors?
-                # User plan implies we need inference first.
-                # Let's wait for Analyst.
-                return
-
-            # Predict with Full Bayes (returns dict with gap metrics)
+            if hours_left <= 0:
+                return  # Market closed
+            
+            # ═══════════════════════════════════════════════════════════
+            # 4. CALCULATE JENSEN'S GAP
+            # ═══════════════════════════════════════════════════════════
             prediction = self.engine.predict_fast(mid_price, hours_left, posterior)
             fair_value = prediction["fair_value"]
-            gap_cents = prediction["gap_cents"]
             
-            # 4. Decision Based on Jensen's Gap
-            # Gap > 0: Market underpriced (Fair Value > Naive Price)
-            # Gap < 0: Market overpriced (Fair Value < Naive Price)
+            # ═══════════════════════════════════════════════════════════
+            # 5. DECISION LOGIC (Gap vs Actual Executable Prices)
+            # ═══════════════════════════════════════════════════════════
+            # BUY Gap: Fair Value must exceed what we PAY (ask price)
+            # SELL Gap: What we RECEIVE (bid price) must exceed fair value
             
-            edge_threshold = Config.JENSEN_GAP_THRESHOLD_CENTS
+            buy_gap = fair_value - ask_price
+            sell_gap = bid_price - fair_value
             
-            # BUY signal: Gap is positive and significant
-            # Fair value exceeds market ask
-            if gap_cents > edge_threshold and fair_value > (best_ask/100.0):
-                 # Aggressive take
-                logger.info(f"BUY {ticker}: Gap={gap_cents:.2f}¢ Fair={fair_value:.3f} Ask={best_ask}¢")
-                qty = self.order_manager.calculate_kelly_size(ticker, fair_value - (best_ask/100.0), 1.0, self.order_manager.balance)
+            edge_threshold_dollars = Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0
+            
+            # BUY signal: Fair value exceeds ask by threshold
+            if buy_gap > edge_threshold_dollars:
+                logger.info(
+                    f"BUY {ticker}: BuyGap={buy_gap*100:.2f}¢ "
+                    f"Fair={fair_value:.4f} Ask={ask_price:.4f} "
+                    f"TTE={hours_left:.1f}h"
+                )
+                qty = self.order_manager.calculate_kelly_size(
+                    ticker, buy_gap, 1.0, self.order_manager.balance
+                )
                 if qty > 0:
-                    await self.client.create_order(ticker, "buy", "yes", qty, best_ask)
+                    # Convert back to cents for order (API expects integer cents)
+                    ask_cents = int(round(ask_price * 100))
+                    await self.client.create_order(ticker, "buy", "yes", qty, ask_cents)
             
-            # SELL signal: Gap is negative and significant
-            # Fair value below market bid
-            elif gap_cents < -edge_threshold and fair_value < (best_bid/100.0):
-                logger.info(f"SELL {ticker}: Gap={gap_cents:.2f}¢ Fair={fair_value:.3f} Bid={best_bid}¢")
-                no_price = 100 - best_bid
-                qty = self.order_manager.calculate_kelly_size(ticker, (best_bid/100.0) - fair_value, 1.0, self.order_manager.balance)
+            # SELL signal: Bid exceeds fair value by threshold
+            elif sell_gap > edge_threshold_dollars:
+                logger.info(
+                    f"SELL {ticker}: SellGap={sell_gap*100:.2f}¢ "
+                    f"Fair={fair_value:.4f} Bid={bid_price:.4f} "
+                    f"TTE={hours_left:.1f}h"
+                )
+                qty = self.order_manager.calculate_kelly_size(
+                    ticker, sell_gap, 1.0, self.order_manager.balance
+                )
                 if qty > 0:
-                    resp = await self.client.create_order(ticker, "buy", "no", qty, no_price)
+                    # Buy NO at complement price
+                    no_price_cents = int(round((1.0 - bid_price) * 100))
+                    await self.client.create_order(ticker, "buy", "no", qty, no_price_cents)
 
         except Exception as e:
             logger.error(f"Eval Error {ticker}: {e}")
@@ -172,6 +229,7 @@ class Trader:
         """
         The Analyst (Slow Loop).
         Periodically infers latent parameters for all active markets.
+        Creates "Trajectories" valid for ~10 minutes.
         """
         logger.info("Analyst Loop Started")
         while self.running:
@@ -183,54 +241,55 @@ class Trader:
                     start_ts = int((now - timedelta(hours=Config.INFERENCE_WINDOW_HOURS)).timestamp())
                     
                     try:
-                        # Fetch meta to know close_time for TTE Calc
-                        # Optimization: Use self.active_markets_meta if populated, or fetch candles meta
-                        # 3b. Run Inference (CPU Bound)
-                        
-                        # We need TTE.
-                        # We can get it from the last candle? No, candle is history.
-                        # We need 'close_time' of the market.
-                        # `self.active_markets_meta` should have it?
-                        # If not, we fetched candles.
-                        # Let's assume we have it or can get it.
-                        # For robustness, let's fetch market details if missing.
-                        
-                        # Assumption: active_markets_meta is populated in update_market_structure
-                        # But loop runs async.
+                        # Get market metadata for TTE calculation
                         market_meta = self.active_markets_meta.get(ticker)
                         if not market_meta:
-                            # Fetch
-                            m_resp = await self.client.get_markets(ticker=ticker) # Singular?
+                            # Fetch if missing
+                            m_resp = await self.client.get_markets(ticker=ticker)
                             if m_resp and 'markets' in m_resp and len(m_resp['markets']) > 0:
                                 market_meta = m_resp['markets'][0]
                                 self.active_markets_meta[ticker] = market_meta
                         
-                        if not market_meta: continue
+                        if not market_meta:
+                            continue
                         
                         close_time_str = market_meta.get('close_time') or market_meta.get('expiration_time')
                         close_time = parser.isoparse(close_time_str)
-                        if close_time.tzinfo is None: close_time = close_time.replace(tzinfo=timezone.utc)
+                        if close_time.tzinfo is None:
+                            close_time = close_time.replace(tzinfo=timezone.utc)
                         
                         tte_hours = (close_time - now).total_seconds() / 3600.0
-                        if tte_hours <= 0: continue
+                        if tte_hours <= 0:
+                            continue  # Market closed
 
+                        # 2. Fetch candlestick data
                         c_resp = await self.client.get_candlesticks(ticker, start_ts, end_ts, 60)
                         candles = c_resp.get("candlesticks", [])
+                        
+                        if not candles or len(candles) < Config.MIN_OBSERVATIONS_FOR_INFERENCE:
+                            logger.debug(f"{ticker}: Insufficient candles ({len(candles)}), skipping")
+                            continue
+                        
                         recent_prices = [c['c'] / 100.0 for c in candles]
                         
-                        # 2. Infer (Heavy CPU)
+                        # 3. Infer (Heavy CPU - run in executor to avoid blocking)
                         posterior = await asyncio.get_running_loop().run_in_executor(
                             None, 
-                            self.engine.infer_posterior, 
-                            recent_prices,
-                            tte_hours
+                            lambda: asyncio.run(self.engine.infer_posterior(recent_prices, tte_hours))
                         )
                         
-                        # 3. Update Cache
+                        # 4. Update Cache with Validity Timestamp
+                        current_time = time.time()
+                        valid_until = current_time + (self.TRAJECTORY_VALIDITY_MINUTES * 60)
+                        
                         async with self.posterior_lock:
-                            self.posterior_cache[ticker] = posterior
+                            self.posterior_cache[ticker] = {
+                                'trace': posterior,
+                                'timestamp': current_time,
+                                'valid_until': valid_until
+                            }
                             
-                        logger.info(f"Analyst: Updated Posterior for {ticker}")
+                        logger.info(f"Analyst: Updated Posterior for {ticker} (valid for {self.TRAJECTORY_VALIDITY_MINUTES}min)")
                         
                     except Exception as e:
                         logger.error(f"Analyst Error {ticker}: {e}")
@@ -238,7 +297,8 @@ class Trader:
             except Exception as e:
                 logger.error(f"Analyst Loop Crash: {e}")
                 
-            await asyncio.sleep(60 * 5) # Run every 5 mins
+            # Run every 1 minute (was 5 minutes - too slow for volatile markets)
+            await asyncio.sleep(60)
 
     async def run(self):
         async with self.client:

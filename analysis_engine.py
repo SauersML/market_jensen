@@ -117,8 +117,21 @@ class AnalysisEngine:
             volatility = pm.Deterministic("volatility", pt.exp(log_volatility))
             
             # ───────────────────────────────────────────────────────────
-            # 2c. LATENT SIGNAL (True Log-Odds) - NON-PARAMETRIC
+            # 2c. LATENT SIGNAL (True Log-Odds) - SEMI-PARAMETRIC
             # ───────────────────────────────────────────────────────────
+            
+            # **CRITICAL: Semi-Parametric Split**
+            # 
+            # NUTS requires continuous, differentiable distributions for gradient computation.
+            # We cannot directly use the discrete "bag of residuals" (Library of Noise) here.
+            # 
+            # Solution:
+            # - INFERENCE (here): Use Student-T as a parametric proxy to infer latent volatility
+            # - SIMULATION (predict_fast): Use empirical residuals from Library of Noise
+            # 
+            # This split ensures:
+            # 1. Computational feasibility (NUTS can compute gradients)
+            # 2. Statistical correctness (forward simulations use actual market behavior)
             
             # Load empirical residuals if available (Library of Noise)
             if self.empirical_residuals is not None and len(self.empirical_residuals) > 100:
@@ -426,38 +439,78 @@ class AnalysisEngine:
         }
         
         # ═══════════════════════════════════════════════════════════════
-        # 4. EXTRACT LIBRARY OF NOISE (Empirical Residuals)
+        # 4. EXTRACT LIBRARY OF NOISE (Local Volatility Normalized)
         # ═══════════════════════════════════════════════════════════════
         
-        logger.info("Extracting empirical residuals (Library of Noise)...")
+        logger.info("Extracting empirical residuals with local volatility normalization...")
         
-        # Join market-level volatility back to dataframe
-        df = df.join(
-            market_stats.select(["market_ticker", "realized_vol"]),
-            on="market_ticker",
-            how="left"
-        )
+        # Group by market and calculate rolling local volatility
+        all_residuals = []
         
-        # Standardize residuals by local realized volatility
-        # standardized_residual = (return - drift) / realized_vol
-        df = df.with_columns([
-            ((pl.col("ret") - drift_mu) / pl.col("realized_vol")).alias("std_residual")
-        ])
+        for ticker in df["market_ticker"].unique():
+            market_df = df.filter(pl.col("market_ticker") == ticker).sort("timestamp")
+            
+            # Extract returns (already calculated)
+            returns_series = market_df["ret"]
+            returns = returns_series.to_numpy()
+            
+            # Skip markets with insufficient data
+            if len(returns) < 20 or returns_series.is_null().sum() >= len(returns) - 10:
+                continue
+            
+            # Calculate LOCAL volatility using Exponentially Weighted Moving Average (EWMA)
+            # This captures volatility regime changes (quiet vs. volatile periods)
+            window_size = 20  # ~20 candles lookback
+            alpha = 2.0 / (window_size + 1)  # EWMA decay factor
+            
+            # Initialize variance estimate with first window
+            valid_returns = returns[~np.isnan(returns)]
+            if len(valid_returns) < window_size:
+                continue
+                
+            var_ewma = np.var(valid_returns[:window_size])
+            local_vols = []
+            
+            # Compute EWMA variance for each time step
+            for i, ret in enumerate(returns):
+                if np.isnan(ret):
+                    # Preserve NaN positions
+                    local_vols.append(np.nan)
+                    continue
+                    
+                if i >= window_size:
+                    # Update EWMA: var_t = α * ret² + (1-α) * var_{t-1}
+                    var_ewma = alpha * (ret ** 2) + (1 - alpha) * var_ewma
+                
+                # Store volatility (sqrt of variance)
+                local_vols.append(np.sqrt(max(var_ewma, 1e-8)))
+            
+            local_vols = np.array(local_vols)
+            
+            # Standardize residuals by LOCAL volatility (not global)
+            # This ensures a +5 cent move in a quiet period (low vol) gets higher weight
+            # than the same move during a volatile period (high vol)
+            standardized = (returns - drift_mu) / (local_vols + 1e-8)
+            
+            # Filter out nulls and infinities
+            valid_mask = np.isfinite(standardized)
+            valid_residuals = standardized[valid_mask]
+            
+            all_residuals.extend(valid_residuals.tolist())
         
-        # Extract all standardized residuals (drop nulls from diff operation)
-        residuals = df.filter(
-            pl.col("std_residual").is_not_null() & 
-            pl.col("std_residual").is_finite()
-        )["std_residual"].to_numpy()
+        if len(all_residuals) < 100:
+            logger.warning(f"Insufficient residuals ({len(all_residuals)}). Using parametric fallback.")
+            self.empirical_residuals = np.random.standard_normal(1000)
+        else:
+            self.empirical_residuals = np.array(all_residuals)
         
-        # Store as empirical distribution
-        self.empirical_residuals = residuals
-        
-        logger.info(f"Library of Noise: {len(residuals)} empirical innovations extracted")
-        logger.info(f"  Mean: {np.mean(residuals):.4f}")
-        logger.info(f"  Std: {np.std(residuals):.4f}")
-        logger.info(f"  Skew: {float(pl.Series(residuals).skew()):.4f}")
-        logger.info(f"  [5%, 95%]: [{np.percentile(residuals, 5):.3f}, {np.percentile(residuals, 95):.3f}]")
+        # Log summary statistics
+        logger.info(f"Library of Noise: {len(self.empirical_residuals)} empirical innovations extracted")
+        logger.info(f"  Mean: {np.mean(self.empirical_residuals):.4f} (should be ~0)")
+        logger.info(f"  Std: {np.std(self.empirical_residuals):.4f} (should be ~1)")
+        logger.info(f"  Skew: {stats.skew(self.empirical_residuals):.4f}")
+        logger.info(f"  Kurtosis: {stats.kurtosis(self.empirical_residuals):.2f} (>3 = fat tails)")
+        logger.info(f"  [1%, 99%]: [{np.percentile(self.empirical_residuals, 1):.3f}, {np.percentile(self.empirical_residuals, 99):.3f}]")
         
         # ═══════════════════════════════════════════════════════════════
         # 5. SAVE
