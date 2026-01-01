@@ -157,53 +157,10 @@ class Trader:
             # Staleness check
             current_time = time.time()
             if current_time > posterior_data.get('valid_until', 0):
-                logger.warning(f"{ticker}: Cached posterior expired, waiting for analyst...")
+                logger.warning(f"{ticker}: Cached posterior expired, awaiting fresh inference...")
                 return
             
             posterior = posterior_data['trace']
-            
-            # ═══════════════════════════════════════════════════════════
-            # 2a. REGIME DETECTION (Cache Invalidation)
-            # ═══════════════════════════════════════════════════════════
-            # IMPORTANT: This is NOT a failure of Bayesian modeling.
-            # In a real-time Bayesian system, the posterior would naturally widen
-            # when surprised by data. However, we cache posteriors for 60s-10min.
-            # 
-            # If a news event occurs, the CACHED model hasn't seen the new data.
-            # This detector invalidates stale caches, forcing re-inference.
-            # 
-            # Future: Replace with online Bayesian updates (particle filters, etc.)
-            
-            try:
-                # Extract inferred signal from last timestep of trace
-                latent_log_odds = posterior.posterior["latent_log_odds"].values
-                inferred_signal_samples = latent_log_odds[:, :, -1].flatten()
-                inferred_signal = np.mean(inferred_signal_samples)
-                inferred_vol = np.std(inferred_signal_samples)
-                
-                # Current market in log-odds space
-                current_logit = self.engine._logit(mid_price)
-                
-                # Deviation in units of σ
-                deviation = abs(current_logit - inferred_signal)
-                sigma_threshold = Config.REGIME_DETECTION_SIGMA_THRESHOLD
-                
-                if deviation > sigma_threshold * inferred_vol:
-                    logger.warning(
-                        f"{ticker}: Cache invalidated - "
-                        f"price moved {deviation/inferred_vol:.1f}σ from cached model "
-                        f"(threshold: {sigma_threshold}σ). Awaiting fresh inference."
-                    )
-                    # Force re-inference on next analyst cycle
-                    async with self.posterior_lock:
-                        if ticker in self.posterior_cache:
-                            del self.posterior_cache[ticker]
-                    return  # Skip this tick
-                    
-            except Exception as e:
-                logger.debug(f"{ticker}: Regime detection failed: {e}")
-                # Don't block trading on regime detection errors
-                pass
             
             # ═══════════════════════════════════════════════════════════
             # 3. TIME TO EXPIRY

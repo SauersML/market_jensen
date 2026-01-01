@@ -49,7 +49,6 @@ class Config:
     # Trading Costs & Risk Controls
     TAKER_FEE_RATE = 0.007  # 70 basis points (Kalshi taker fee)
     CONFIDENCE_MULTIPLIER = 1.5  # Conservative safety margin for spread
-    REGIME_DETECTION_SIGMA_THRESHOLD = 3.0  # Invalidate cache if price moves >Nσ from model
 
     # Data & Volatility
     MIN_VOLATILITY_DATA_POINTS = 50
