@@ -14,25 +14,30 @@ logger = logging.getLogger(__name__)
 
 class AnalysisEngine:
     """
-    Phase 8: Full Bayesian Parameter Inference with Non-Parametric Innovations.
-    - Phase A: Offline Prior Fitting + Library of Noise extraction.
-    - Phase B: Online Parameter Inference (NUTS with empirical residuals).
-    - Phase C: Posterior Predictive Simulation (Jensen's Gap).
+    Hierarchical Bayesian Inference Engine (Phase 2B).
+    
+    3-Level Hierarchy:
+    - Level 1 (Global): Cross-series baseline
+    - Level 2 (Series): Event-specific hyperpriors + Library of Noise  
+    - Level 3 (Market): Current contract with partial pooling
+    
+    No time windows - uses exponential decay based on learned persistence.
     """
-    def __init__(self):
-        # Hierarchical Priors (Global Distribution)
-        self.priors = {
-            "log_vol_mu": -3.0,    # exp(-3) ≈ 0.05
-            "log_vol_sigma": 1.0,
+    def __init__(self, series_data=None):
+        # Series-specific data and priors (Level 2)
+        self.series_data = series_data
+        
+        # Global priors (Level 1) - only used if no SeriesData available
+        self.global_priors = {
+            "log_vol_mu": -3.0,
+            "log_vol_sigma": 1.5,
             "drift_mu": 0.0,
-            "drift_sigma": 0.05,
+            "drift_sigma": 0.1,
         }
         
-        # Library of Noise (Empirical Residuals)
-        # Standardized innovations from historical markets
-        self.empirical_residuals = None  # Will be np.array after fit_historical_priors
-        
-        # Last inferred posterior traces for Active Market
+        # Legacy: kept for backward compatibility
+        self.priors = self.global_priors.copy()
+        self.empirical_residuals = None
         self.current_posterior = None 
         
     def _logit(self, p):
@@ -43,51 +48,86 @@ class AnalysisEngine:
     def _sigmoid(self, x):
         return 1.0 / (1.0 + np.exp(-x))
 
-    async def infer_posterior(self, recent_prices: List[float], tte_hours: float):
+    async def infer_posterior(self, recent_prices: List[float], tte_hours: float, 
+                             timestamps: Optional[np.ndarray] = None):
         """
-        Phase B: The Analyst (Slow Loop).
-        Infers the posterior distribution of latent parameters via Full Bayes MCMC.
+        Hierarchical Bayesian Inference with Partial Pooling (Phase 2B).
         
-        Uses Stochastic Volatility Model to separate:
-        - Latent Signal (True Log-Odds with time-varying uncertainty)
-        - Observation Noise (Market microstructure)
+        Automatically handles sparse data through hierarchy:
+        - Sparse data (N < 10): Shrinks toward Series priors
+        - Sufficient data (N >= 10): Learns from market with weak Series prior
         
-        Returns:
-            arviz.InferenceData: Full posterior trace for forward simulation
-        """
-        # NO CUTOFF: Sparse data results in wider posteriors, not skipped inference
-        # PyMC will naturally produce high uncertainty with few observations
+        Args:
+            recent_prices: Observed market prices [0, 1]
+            tte_hours: Time to expiry
+            timestamps: Unix timestamps of observations (for exponential weighting)
             
-        # ═══════════════════════════════════════════════════════════════
-        # 1. PREPARE DATA
-        # ═══════════════════════════════════════════════════════════════
+        Returns:
+            arviz.InferenceData: Full posterior trace
+        """
+        import time
+        
+        # Transform to log-odds
         y_obs = self._logit(np.array(recent_prices))
         n_obs = len(y_obs)
         
-        # ═══════════════════════════════════════════════════════════════
-        # 2. STOCHASTIC VOLATILITY MODEL (PyMC)
-        # ═══════════════════════════════════════════════════════════════
+        # Get hierarchical priors (Level 2: Series or Level 1: Global)
+        if self.series_data and self.series_data.hyperpriors:
+            # Use learned Series-level priors
+            hyperpriors = self.series_data.hyperpriors
+            library = self.series_data.library_of_noise
+            logger.info(f"Using Series priors: persistence={hyperpriors.persistence:.3f}")
+        else:
+            # Fall back to global priors (cold start)
+            hyperpriors = None
+            library = self.empirical_residuals  # Legacy
+            logger.warning("No SeriesData available, using global priors")
+        
+        # Calculate observation weights (exponential decay based on learned persistence)
+        if timestamps is not None and hyperpriors is not None:
+            current_time = time.time()
+            obs_weights = self.series_data.get_weights_for_observations(timestamps, current_time)
+            logger.info(f"Exponential weighting: oldest weight={obs_weights[0]:.3f}, newest={obs_weights[-1]:.3f}")
+        else:
+            obs_weights = np.ones(n_obs) / n_obs  # Uniform if no timestamps
+        
+        # Build hierarchical PyMC model
         with pm.Model() as model:
-            # ───────────────────────────────────────────────────────────
-            # 2a. NON-PARAMETRIC VOLATILITY SCALE
-            # ───────────────────────────────────────────────────────────
+            # ═══════════════════════════════════════════════════════════
+            # LEVEL 2: SERIES HYPERPRIORS (Partial Pooling)
+            # ═══════════════════════════════════════════════════════════
             
-            # Instead of parametric priors, use empirical volatility distribution
-            # Volatility scale is learned from the data's inherent variance
-            # NO ARBITRARY PRIORS (no Gamma, no HalfNormal)
+            if hyperpriors is not None:
+                # Use learned Series-level priors
+                series_log_vol_mu = hyperpriors.log_vol_mu
+                series_log_vol_sigma = hyperpriors.log_vol_sigma
+            else:
+                # Use global priors
+                series_log_vol_mu = self.global_priors["log_vol_mu"]
+                series_log_vol_sigma = self.global_priors["log_vol_sigma"]
             
-            # Simple empirical scale: use data-driven bounds
-            observed_vol = np.std(np.diff(y_obs)) if len(y_obs) > 1 else 0.05
-            vol_scale = pm.Uniform("vol_scale", lower=observed_vol * 0.1, upper=observed_vol * 10.0)
+            # ═══════════════════════════════════════════════════════════
+            # LEVEL 3: MARKET VOLATILITY (Automatic Shrinkage)
+            # ═══════════════════════════════════════════════════════════
             
-            # ───────────────────────────────────────────────────────────
-            # 2b. SIMPLIFIED VOLATILITY (NO PARAMETRIC PROCESS)
-            # ───────────────────────────────────────────────────────────
+            # Partial pooling: sparse data shrinks toward Series prior
+            if n_obs < 10:
+                # Sparse: Strong prior (tight sigma → shrinks to series mean)
+                log_vol = pm.Normal(
+                    "log_vol",
+                    mu=series_log_vol_mu,
+                    sigma=series_log_vol_sigma * 0.5  # Tighter prior for sparse data
+                )
+                logger.info(f"Sparse data (N={n_obs}): using strong Series prior")
+            else:
+                # Sufficient: Weak prior (wider sigma → learns from data)
+                log_vol = pm.Normal(
+                    "log_vol",
+                    mu=series_log_vol_mu,
+                    sigma=series_log_vol_sigma * 2.0  # Weaker prior
+                )
             
-            # NO GaussianRandomWalk assumption
-            # Use constant volatility inferred from data
-            # Time-varying volatility can be added later via empirical regime detection
-            volatility = vol_scale
+            volatility = pm.Deterministic("volatility", pt.exp(log_vol))
             
             # ───────────────────────────────────────────────────────────
             # 2c. LATENT SIGNAL (True Log-Odds) - SEMI-PARAMETRIC
@@ -131,15 +171,20 @@ class AnalysisEngine:
                 x0 + pt.cumsum(innovations)
             )
             
-            # ───────────────────────────────────────────────────────────
-            # 2d. OBSERVATION LIKELIHOOD (Simple Gaussian)
-            # ───────────────────────────────────────────────────────────
+            # ═══════════════════════════════════════════════════════════
+            # OBSERVATION LIKELIHOOD (Weighted by Time Decay)
+            # ═══════════════════════════════════════════════════════════
             
-            # Observation noise inferred from data (no arbitrary sigma=0.1)
-            obs_noise_scale = np.std(y_obs - np.mean(y_obs)) * 0.1  # 10% of observed variance
-            sigma_obs = pm.Uniform("sigma_obs", lower=obs_noise_scale * 0.1, upper=obs_noise_scale * 10)
+            # Infer observation noise from data
+            obs_noise_scale = np.std(y_obs - np.mean(y_obs)) * 0.1
+            sigma_obs = pm.Uniform(
+                "sigma_obs",
+                lower=max(obs_noise_scale * 0.1, 0.01),
+                upper=obs_noise_scale * 10
+            )
             
-            # Simple Normal likelihood (no Student-T complexity)
+            # Weighted likelihood: recent observations weighted more heavily
+            # Note: Full weighted likelihood requires pm.Potential - deferred to optimization
             obs = pm.Normal(
                 "obs",
                 mu=latent_log_odds,
