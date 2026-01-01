@@ -36,49 +36,69 @@ class OrderManager:
     def calculate_kelly_size(self, fair_value: float, market_price: float, 
                                bankroll: float, posterior_samples: np.ndarray) -> int:
         """
-        True Kelly Criterion with posterior uncertainty.
-        f* = E[Kelly(θ)] integrated over posterior distribution.
+        Exact Kelly Criterion via Numerical Optimization (Phase 2D).
+        
+        Maximizes E[log(1 + f * payoff)] over full posterior distribution.
+        No approximation - uses scipy.optimize for exact f*.
         
         Args:
-            fair_value: Posterior mean fair value
+            fair_value: Posterior mean (not used in exact version)
             market_price: Current ask (for buy) or bid (for sell)
             bankroll: Total available capital
-            posterior_samples: Array of posterior fair values from MCMC
+            posterior_samples: Array of posterior terminal probabilities
         """
-        # Kelly formula for binary outcomes: f = (p*b - q) / b
-        # where p = win probability, q = 1-p, b = odds
+        from scipy.optimize import minimize_scalar
         
-        kelly_fractions = []
-        for sample_fair in posterior_samples:
-            # Odds: how much you win per dollar risked
-            # For prediction market: if buying at X, winning pays (1 - X)
-            if market_price > 0.99 or market_price < 0.01:
-                continue  # Avoid division by zero
+        def expected_log_growth(f):
+            """
+            Expected log wealth change over full posterior.
+            
+            For each posterior sample of win probability p:
+            - Win: wealth multiplied by (1 + f * payoff_win)
+            - Lose: wealth multiplied by (1 + f * payoff_lose)
+            """
+            if f <= 0:
+                return 1e10  # Large penalty for non-positive bets
+            
+            log_growths = []
+            for p_win in posterior_samples:
+                # Binary contract payoffs
+                payoff_win = (1.0 - market_price) / market_price  # Winning return
+                payoff_lose = -1.0  # Lose entire bet
                 
-            # Win probability from this posterior sample
-            p = sample_fair
-            # Odds (payoff ratio)
-            b = (1.0 - market_price) / market_price
+                # Expected log growth for this posterior sample
+                if 1 + f * payoff_lose <= 0:  # Avoid catastrophic loss
+                    return 1e10
+                
+                log_g = (
+                    p_win * np.log(1 + f * payoff_win) +
+                    (1 - p_win) * np.log(1 + f * payoff_lose)
+                )
+                log_growths.append(log_g)
             
-            # Kelly fraction
-            f_kelly = (b * p - (1 - p)) / b
-            kelly_fractions.append(max(0, f_kelly))  # No negative bets
+            # Return negative (for minimization)
+            return -np.mean(log_growths)
         
-        if len(kelly_fractions) == 0:
-            return 0
-            
-        # Expected Kelly over posterior uncertainty
-        f_star = np.mean(kelly_fractions)
+        # Optimize f in [0, 0.5] (max 50% of bankroll)
+        result = minimize_scalar(
+            expected_log_growth,
+            bounds=(0.0, 0.5),
+            method='bounded'
+        )
         
-        # Fractional Kelly for safety (quarter-Kelly = 0.25)
+        f_optimal = result.x
+        
+        # Apply fractional Kelly dampener
         from config import Config
-        f_dampened = f_star * Config.KELLY_FRACTION
+        f_dampened = f_optimal * Config.KELLY_FRACTION
         
         # Convert to contract quantity
         position_value = bankroll * f_dampened
         contracts = int(position_value / market_price)
         
-        return max(0, min(contracts, int(bankroll / market_price)))  # Cap at max affordable
+        logger.info(f"Kelly optimization: f*={f_optimal:.4f}, dampened={f_dampened:.4f}, contracts={contracts}")
+        
+        return max(0, min(contracts, int(bankroll / market_price)))
 
 class Trader:
     """
