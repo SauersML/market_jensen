@@ -1,4 +1,13 @@
-cryptography
-requests
 numpy
 scipy
+pandas
+requests
+cryptography
+polars
+cachetools
+statsmodels
+scikit-learn
+joblib
+websockets
+python-dotenv
+apscheduler
