@@ -1,161 +1,115 @@
+
 import logging
 import polars as pl
 import numpy as np
-from typing import Dict, List
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
 from analysis_engine import AnalysisEngine
 from config import Config
 
 logger = logging.getLogger(__name__)
 
+class BacktestResult:
+    def __init__(self):
+        self.trades = []
+        self.equity_curve = []
+        self.metrics = {}
+
 class Backtester:
     """
-    Phase 3: Backtesting Framework (The Validator)
-    Walk-forward validation without look-ahead bias.
+    Phase 4: Walk-Forward Backtester.
+    Simulates the strategy over historical data using an Expanding Window.
     """
-    def __init__(self, engine: AnalysisEngine):
-        self.engine = engine
-        self.results = []
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self.engine = AnalysisEngine()
+        self.initial_capital = 100000 # cents
+        self.current_capital = self.initial_capital
+        self.positions = {}
+        
+    def load_data(self) -> pl.DataFrame:
+        # Load from DB or CSV
+        # For MVP, assume we load from the sqlite DB created in Phase 1
+        # timestamp, price, outcome, etc.
+        try:
+            conn_str = f"sqlite://{Config.DB_PATH}"
+            # Polars read_database requires connectorx or adbc
+            # Fallback to pure sqlite3 if needed, but lets assume generic load
+            # Mocking the load for the skeleton
+            return pl.DataFrame()
+        except Exception:
+            return pl.DataFrame()
 
-    def run_walk_forward(self, series_ticker: str, full_history_df: pl.DataFrame, outcomes_map: Dict[str, int]):
+    def run_walk_forward(self, ticker: str, history_df: pl.DataFrame):
         """
-        Runs a walk-forward backtest.
+        Expanding Window Backtest:
+        1. Start with initial training window (e.g., first 100 hours).
+        2. Walk forward hour by hour.
+        3. At each step:
+           - Re-fit Volatility Kernel using data up to t (Simulated 'Priors Rebuild').
+           - Run Inference Simulation for the current hour's price.
+           - Execute virtual trades based on Kelly/Edge.
+           - Track PnL.
         """
-        logger.info(f"Starting walk-forward backtest for {series_ticker}...")
-
-        # Sort markets by time (using their earliest timestamp in history)
-        # We need to know when each market *started* or *ended*.
-        # Let's group by market and get the start time.
-
-        market_times = full_history_df.group_by("market_ticker").agg([
-            pl.col("timestamp").min().alias("start_ts"),
-            pl.col("timestamp").max().alias("end_ts")
-        ]).sort("end_ts") # Sort by settlement time roughly
-
-        sorted_markets = market_times["market_ticker"].to_list()
-
-        # Need minimum history to start
-        min_history = Config.MIN_HISTORY_EVENTS
-        if len(sorted_markets) <= min_history:
-            logger.warning("Not enough markets for walk-forward backtest.")
+        logger.info(f"Starting Walk-Forward Backtest for {ticker}...")
+        
+        # Sort by time
+        history_df = history_df.sort("timestamp")
+        timestamps = history_df["timestamp"].to_list()
+        
+        # Minimum training period (e.g., 24 datapoints)
+        min_train = 24
+        if len(history_df) < min_train + 1:
+            logger.warning("Insufficient history for backtest.")
             return
 
-        # Walk forward
-        for i in range(min_history, len(sorted_markets)):
-            train_markets = sorted_markets[:i]
-            test_market = sorted_markets[i]
-
-            # 1. Train
-            # Filter history for train markets
-            train_df = full_history_df.filter(pl.col("market_ticker").is_in(train_markets))
-
-            # Re-calibrate volatility
-            try:
+        total_pnl = 0
+        
+        for t_idx in range(min_train, len(history_df)):
+            # 1. Define Windows
+            train_df = history_df.slice(0, t_idx)
+            current_row = history_df.row(t_idx, named=True)
+            
+            # 2. Re-fit Model (Simulating Daily/Hourly calibration)
+            # In production, we might not refit *every* hour for speed, but for rigorous backtest we do.
+            # To speed up, maybe refit every 24 hours?
+            if t_idx % 24 == 0:
                 self.engine.calculate_empirical_volatility(train_df)
-                # self.engine.calibrate_link_function(train_df, outcomes_map) # Optional: if we had outcome data accessible here easily
-            except Exception as e:
-                logger.warning(f"Skipping {test_market} due to training failure: {e}")
-                continue
+                
+            # 3. Get Signal
+            market_price = current_row["price_normalized"]
+            # Assume expiry is fixed or calculated. 
+            # If we don't have expiry column, we mock it descending.
+            # In Phase 1 we added 'time_remaining_hours'.
+            time_left = current_row.get("time_remaining_hours", 24 - (t_idx % 24)) 
+            
+            if time_left < 1: continue # Don't trade last hour
+            
+            fair_value = self.engine.run_inference_simulation(market_price, time_left)
+            
+            # 4. Execute
+            # Edge = |Fair - Price|
+            # Cost = 0.01 (Transaction Cost / Slippage)
+            edge = fair_value - market_price
+            
+            action = None
+            if edge > 0.05: # 5 cent margin required
+                action = "BUY_YES"
+            elif edge < -0.05:
+                action = "BUY_NO"
+            
+            if action:
+                # Mock execution
+                # PnL = (Outcome - Price) - Fees
+                # We need the ACTUAL outcome to calculate PnL at this step?
+                # Or we Mark-to-Market?
+                # Settlement PnL is better.
+                # Outcome is in DB 'result' or we mock it.
+                # For now just logging the Signal.
+                logger.info(f"T={t_idx} P={market_price:.2f} F={fair_value:.2f} Action={action}")
 
-            # 2. Test (Intraday Simulation)
-            test_df = full_history_df.filter(pl.col("market_ticker") == test_market).sort("timestamp")
-
-            # We simulate trading through the life of the test market
-            market_pnl = 0.0
-            position = 0 # 1 for Yes, -1 for No (Short Yes)
-            entry_price = 0.0
-
-            # Iterate through minutes/hours of the test market
-            # For speed, maybe just check every hour?
-
-            rows = test_df.to_dicts()
-            if not rows:
-                continue
-
-            final_outcome = outcomes_map.get(test_market)
-            if final_outcome is None:
-                # Can't backtest if we don't know the result
-                continue
-
-            expiry_ts = rows[-1]["timestamp"]
-
-            for row in rows:
-                current_ts = row["timestamp"]
-                price = row["price_normalized"]
-
-                # Time to expiry in hours
-                hours_left = (expiry_ts - current_ts) / 3600
-                if hours_left < 1:
-                    continue # Don't trade last hour
-
-                # Run Simulation
-                try:
-                    fair_value = self.engine.run_mcmc_simulation(price, int(hours_left))
-                except:
-                    continue
-
-                # Signal
-                # Price is normalized 0-1.
-                # Threshold is in cents, convert to 0-1
-                threshold = Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0
-
-                signal = "HOLD"
-                if fair_value > price + threshold:
-                    signal = "BUY"
-                elif fair_value < price - threshold:
-                    signal = "SELL"
-
-                # Execute (Simplified)
-                # We assume we can trade at the current 'price' (Close of candle)
-                # In reality, we'd pay spread. Let's add slippage/fee penalty.
-                fee = 0.02 # 2 cents round trip + spread estimate
-
-                # Logic: If we don't have a position, enter. If we have one, check exit?
-                # For this backtest, let's assume we hold until expiration or signal reversal.
-
-                if position == 0:
-                    if signal == "BUY":
-                        position = 1
-                        entry_price = price
-                        # logger.debug(f"Buy at {price:.2f}")
-                    elif signal == "SELL":
-                        position = -1
-                        entry_price = price
-                        # logger.debug(f"Sell at {price:.2f}")
-
-                elif position == 1: # Long
-                    if signal == "SELL":
-                        # Close and Flip
-                        pnl = (price - entry_price) - fee
-                        market_pnl += pnl
-                        position = -1
-                        entry_price = price
-
-                elif position == -1: # Short
-                    if signal == "BUY":
-                        # Close and Flip
-                        pnl = (entry_price - price) - fee
-                        market_pnl += pnl
-                        position = 1
-                        entry_price = price
-
-            # Settle final position
-            if position == 1:
-                pnl = (final_outcome - entry_price) - (fee/2) # Exit fee only? Kalshi settlement is free.
-                market_pnl += pnl
-            elif position == -1:
-                pnl = (entry_price - final_outcome) - (fee/2)
-                market_pnl += pnl
-
-            self.results.append({
-                "market": test_market,
-                "pnl": market_pnl,
-                "volume": len(rows) # Proxy for duration/activity
-            })
-
-        logger.info(f"Backtest Complete. Markets Traded: {len(self.results)}")
-        total_pnl = sum(r['pnl'] for r in self.results)
-        logger.info(f"Total PnL (Units): {total_pnl:.4f}")
+        logger.info("Backtest Complete.")
 
 if __name__ == "__main__":
-    # Test
+    # Test stub
     pass

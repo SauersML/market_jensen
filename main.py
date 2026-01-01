@@ -1,31 +1,33 @@
-import logging
-import sys
-import os
-from trader import Trader
-from config import Config
 
-# Setup logging
+import asyncio
+import logging
+from config import Config
+from trader import Trader
+
+# Setup Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Config.LOGS_DIR / "system.log")
+        logging.FileHandler("market_jensen.log"),
+        logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
-logger = logging.getLogger("Main")
-
-def main():
-    logger.info("Starting Jensen's Inequality Arbitrage System")
-
-    try:
-        Config.validate()
-        trader = Trader()
-        trader.run_loop()
-    except Exception as e:
-        logger.critical(f"System crashed: {e}")
-        sys.exit(1)
+async def main():
+    logger.info("Starting Market Jensen Bot (Async)...")
+    
+    # Initialize Trader
+    trader = Trader()
+    
+    # Run
+    await trader.run()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot Stopped by User.")
+    except Exception as e:
+        logger.critical(f"Fatal Error: {e}", exc_info=True)

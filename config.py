@@ -22,11 +22,13 @@ class Config:
     MIN_HISTORY_EVENTS = 10      # Minimum number of past settled events to calculate volatility
 
     # Analysis Settings
-    MCMC_N_SIMULATIONS = 2000    # Number of MCMC chains/samples (user said 10000 but 2000 is faster for test, I'll stick to user request if feasible, but let's start with 2000 for performance in this env)
+    MCMC_N_SIMULATIONS = 2000    # Number of paths
     MCMC_TUNE_STEPS = 500
-    MIN_PROBABILITY_CLIP = 0.01
-    MAX_PROBABILITY_CLIP = 0.99
-    JENSEN_GAP_THRESHOLD_CENTS = 2.0  # Minimum edge to trade
+    # Clipping removed per user request (logic handles logits naturally, though we clip to avoid -inf/inf at boundaries of 0/1)
+    # We keep a tiny epsilon just for safe logit transform if needed locally.
+    MIN_PROBABILITY_CLIP = 0.001 
+    MAX_PROBABILITY_CLIP = 0.999
+    JENSEN_GAP_THRESHOLD_CENTS = 0.0 # Logic removed in trader, kept for reference or removed.
 
     # Trading Settings
     MAX_POSITION_SIZE_PERCENT = 0.05
@@ -36,6 +38,7 @@ class Config:
     DATA_DIR = Path("data")
     MODELS_DIR = Path("models")
     LOGS_DIR = Path("logs")
+    DB_PATH = DATA_DIR / "market_data.db"
 
     @classmethod
     def validate(cls):

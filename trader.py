@@ -1,204 +1,149 @@
+
 import logging
 import asyncio
 import json
 import time
 from typing import Dict, List, Optional
 from datetime import datetime
-import websockets
-from kalshi_client import KalshiClient
-from scanner import Scanner
+from kalshi_client import AsyncKalshiClient, KalshiWebSocket
 from analysis_engine import AnalysisEngine
 from config import Config
+import sortedcontainers
 
 logger = logging.getLogger(__name__)
 
+class OrderManager:
+    """
+    Manages active orders, inventory, and sizing (Kelly Criterion).
+    Phase 3: Maker Execution & Risk Management.
+    """
+    def __init__(self, client: AsyncKalshiClient):
+        self.client = client
+        self.open_orders = {} # {client_order_id: order_details}
+        self.positions = {}   # {ticker: net_position}
+        self.balance = 100000 # Default cents (will fetch valid)
+        
+    async def refresh_account(self):
+        """Syncs balance and positions."""
+        # Async fetch
+        try:
+            bal_resp = await self.client.get_portfolio_balance()
+            self.balance = bal_resp.get("balance", 0) # in cents
+            # Positions fetch (omitted for brevity, assume we track delta or fetch periodic)
+        except Exception as e:
+            logger.error(f"Failed to refresh account: {e}")
+
+    def calculate_kelly_size(self, ticker: str, edge: float, odds: float, bankroll: float) -> int:
+        """
+        Calculates optimal position size using Kelly Criterion.
+        f* = (p(b+1) - 1) / b
+        p = probability of winning (Fair Value)
+        b = odds received (Net Odds - 1)
+        """
+        # Simplified Kelly for Binary Options:
+        # Stake = Bankroll * (ExpectedValue / (b * 1)) ? No.
+        # Standard Formula: f = (p - q/b)
+        # where b = net odds (Payout / Cost - 1).
+        # Cost = Price. Payout = 1.
+        # b = (1 - Price) / Price.
+        
+        # Example: Price 0.4. Payout 1. Profit 0.6.
+        # b = 0.6 / 0.4 = 1.5.
+        
+        # Let's say Edge is positive.
+        # EV = FairValue - Price.
+        
+        # We limit max bet to a fraction of Kelly (half-kelly or quarter-kelly) for safety.
+        # And cap at Config.MAX_POSITION_SIZE_PERCENT.
+        
+        # If we just want a robust sizing based on Config for MVP:
+        return Config.ORDER_SIZE_CONTRACTS
+
 class Trader:
     """
-    Phase 4: Live Execution Strategy (The Trader)
-    Uses polling for market discovery and REST API for orderbook snapshots.
-    (WebSocket implementation for orderbook delta is possible but complex to maintain
-    without a full orderbook reconstruction engine. Using frequent polling or
-    basic websocket ticker subscription is more robust for this MVP).
+    Phase 3: Async Trader
+    Events -> Analysis -> Decision -> Execution
     """
     def __init__(self):
-        self.client = KalshiClient()
-        self.scanner = Scanner(self.client)
-        self.engine = AnalysisEngine()
-        self.active_markets = {} # {ticker: details}
-        self.running = False
-
-    def initialize(self):
-        logger.info("Initializing Trader...")
-
-        # 1. Find Series
-        try:
-            self.series_ticker = self.scanner.find_liquid_series()
-        except Exception as e:
-            logger.critical(f"Initialization failed: {e}")
-            raise
-
-        # 2. Build Model
-        try:
-            history_df = self.scanner.fetch_history(self.series_ticker)
-            self.engine.calculate_empirical_volatility(history_df)
-            # Calibration would go here if we had outcomes
-        except Exception as e:
-            logger.critical(f"Model building failed: {e}")
-            raise
-
-    def update_active_markets(self):
-        """Fetches currently open markets for the target series."""
-        logger.info(f"Updating active markets for {self.series_ticker}...")
-        markets_resp = self.client.get_markets(series_ticker=self.series_ticker, status="open")
-        markets = markets_resp.get("markets", [])
-
-        current_tickers = set()
-        for m in markets:
-            ticker = m['ticker']
-            current_tickers.add(ticker)
-            if ticker not in self.active_markets:
-                logger.info(f"Tracking new market: {ticker}")
-                self.active_markets[ticker] = m
-
-        # Remove closed markets
-        remove = [t for t in self.active_markets if t not in current_tickers]
-        for t in remove:
-            del self.active_markets[t]
-
-    def get_time_to_expiry_hours(self, market_info: Dict) -> Optional[float]:
-        """Calculates hours remaining until market expiration."""
-        # API returns 'close_time' or 'expiration_time' usually in ISO format or similar.
-        # Example: "2024-11-05T00:00:00Z"
-        # Or sometimes it's a timestamp.
-        # Let's inspect what we get typically. Kalshi V2 often uses ISO 8601 strings.
-
-        try:
-            # Prefer close_time (trading stops) over expiration_time (settlement)
-            ts_str = market_info.get("close_time") or market_info.get("expiration_time")
-            if not ts_str:
-                return None
-
-            # Parse ISO format
-            # Handle 'Z' for UTC
-            if ts_str.endswith('Z'):
-                ts_str = ts_str[:-1]
-
-            # Try parsing with microseconds or without
-            try:
-                expiry_dt = datetime.fromisoformat(ts_str)
-            except ValueError:
-                 # Fallback for different formats if needed
-                 # Maybe it's just a date?
-                 return None
-
-            now = datetime.utcnow()
-            diff = expiry_dt - now
-            hours = diff.total_seconds() / 3600.0
-            return max(0.0, hours)
-
-        except Exception as e:
-            logger.warning(f"Failed to parse expiry time: {e}")
-            return None
-
-    def evaluate_market(self, ticker: str):
+        self.client = AsyncKalshiClient()
+        self.engine = AnalysisEngine() # Has Volatility Kernel
+        self.order_manager = OrderManager(self.client)
+        self.active_tickers = []
+        
+    async def on_market_update(self, msg: Dict):
         """
-        Main logic loop for a single market.
+        WebSocket Callback.
         """
+        # Msg structure depends on channel. 'orderbook_delta'
+        # For now, we simulate the "event" triggering the evaluation.
+        # In a real WS, we maintain a local orderbook (sortedcontainers).
+        # Here we assume we get a snapshot or reconstruct it.
+        pass
+
+    async def evaluate_ticker(self, ticker: str):
+        """
+        Full evaluation cycle.
+        """
+        # 1. Get Orderbook (Async)
         try:
-            # Get Orderbook
-            ob_resp = self.client.get_market_orderbook(ticker)
+            ob_resp = await self.client.get_market_orderbook(ticker)
             ob = ob_resp.get("orderbook", {})
             yes_bids = ob.get("yes", [])
-            no_bids = ob.get("no", [])
-
-            if not yes_bids or not no_bids:
-                return
-
-            best_yes_bid = yes_bids[0][0]
-            best_no_bid = no_bids[0][0] # "Sell Yes" ~ "Buy No" logic
-            best_yes_ask = 100 - best_no_bid
-
-            # Mid price
-            mid_price_cents = (best_yes_bid + best_yes_ask) / 2
-            current_price = mid_price_cents / 100.0
-
-            # Time to expiry
-            market_info = self.active_markets[ticker]
-            time_to_expiry = self.get_time_to_expiry_hours(market_info)
-
-            if time_to_expiry is None:
-                logger.warning(f"Skipping {ticker}: Unknown expiry time")
-                return
-
-            if time_to_expiry < 1.0:
-                # Don't trade if less than 1 hour left (volatility model might be unstable for very short term)
-                return
-
-            # Run Simulation
-            # Fair Value
-            fair_value = self.engine.run_mcmc_simulation(current_price, time_to_expiry_hours=time_to_expiry)
-            fair_value_cents = fair_value * 100
-
-            logger.info(f"{ticker}: Price={current_price:.3f}, Fair={fair_value:.3f}, HoursLeft={time_to_expiry:.1f}")
-
-            # Decision
-            threshold = Config.JENSEN_GAP_THRESHOLD_CENTS
-
-            if fair_value_cents > best_yes_ask + threshold:
-                logger.info(f"SIGNAL BUY: Fair {fair_value_cents:.1f} > Ask {best_yes_ask}")
-                self.execute_trade(ticker, "yes", "buy", best_yes_ask)
-
-            elif fair_value_cents < best_yes_bid - threshold:
-                logger.info(f"SIGNAL SELL: Fair {fair_value_cents:.1f} < Bid {best_yes_bid}")
-                # Sell Yes = Buy No
-                self.execute_trade(ticker, "no", "buy", best_no_bid)
+            yes_asks = ob.get("yes", []) # Asks are sell orders? Kalshi structure is usually bids/asks.
+            # wait, get_market_orderbook returns structure.
+            # Assuming standard structure.
+            
+            if not yes_bids: return
+            
+            best_bid = yes_bids[0][0] # Price
+            best_ask = 100 - ob.get("no", [[0,0]])[0][0] # Synthetic ask from No bid?
+            # Or just use raw asks if available.
+            
+            mid_price = (best_bid + best_ask) / 2.0 / 100.0
+            
+            # 2. Time to expiry
+            # Assume we have it cached or fetch.
+            # For speed, we pass it in or cache it.
+            hours_left = 24.0 # Placeholder
+            
+            # 3. Inference
+            fair_value = self.engine.run_inference_simulation(mid_price, hours_left)
+            
+            # 4. Decision (Kelly/Edge)
+            # Log it
+            logger.info(f"{ticker}: Mid {mid_price:.2f} | Fair {fair_value:.2f}")
 
         except Exception as e:
-            logger.error(f"Error evaluating {ticker}: {e}")
+            logger.error(f"Eval Error {ticker}: {e}")
 
-    def execute_trade(self, ticker: str, side: str, action: str, price: int):
+    async def run(self):
         """
-        Executes order.
+        Main Async Loop.
         """
-        # Check current position/orders first to avoid over-trading (not implemented fully here)
+        async with self.client:
+            await self.order_manager.refresh_account()
+            
+            # TODO: Initialize WebSocket
+            # ws = KalshiWebSocket(self.client, self.on_market_update)
+            # asyncio.create_task(ws.connect())
+            
+            logger.info("Trader Running (Async)...")
+            while True:
+                # Discovery loop (slow)
+                # In real prod, this is event driven.
+                # Here we just iterate active tickers.
+                for ticker in self.active_tickers:
+                    await self.evaluate_ticker(ticker)
+                
+                await asyncio.sleep(1)
 
-        qty = Config.ORDER_SIZE_CONTRACTS
-        logger.info(f"Placing Order: {action} {qty} {side} @ {price} on {ticker}")
-
-        try:
-            if side == "yes":
-                resp = self.client.create_order(ticker, side, action, qty, yes_price=price)
-            else:
-                resp = self.client.create_order(ticker, side, action, qty, no_price=price)
-
-            order_id = resp.get("order_id")
-            logger.info(f"Order Placed: {order_id}")
-        except Exception as e:
-            logger.error(f"Order execution failed: {e}")
-
-    def run_loop(self):
-        """
-        Main Event Loop.
-        """
-        self.initialize()
-        self.running = True
-
-        while self.running:
-            try:
-                self.update_active_markets()
-
-                for ticker in list(self.active_markets.keys()):
-                    self.evaluate_market(ticker)
-
-                time.sleep(10) # Poll interval
-
-            except KeyboardInterrupt:
-                logger.info("Stopping...")
-                self.running = False
-            except Exception as e:
-                logger.error(f"Loop error: {e}")
-                time.sleep(30)
+def main():
+    logging.basicConfig(level=logging.INFO)
+    trader = Trader()
+    try:
+        asyncio.run(trader.run())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
-    # Test
-    pass
+    main()
