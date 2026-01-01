@@ -45,6 +45,11 @@ class Config:
     # Trading Thresholds
     # Jensen's Gap: Difference between Fair Value and Market Price
     JENSEN_GAP_THRESHOLD_CENTS = 2.0
+    
+    # Trading Costs & Risk Controls
+    TAKER_FEE_RATE = 0.007  # 70 basis points (Kalshi taker fee)
+    CONFIDENCE_MULTIPLIER = 1.5  # Conservative safety margin for spread
+    REGIME_DETECTION_SIGMA_THRESHOLD = 3.0  # Invalidate cache if price moves >Nσ from model
 
     # Data & Volatility
     MIN_VOLATILITY_DATA_POINTS = 50

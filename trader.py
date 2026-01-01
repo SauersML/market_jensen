@@ -3,6 +3,7 @@ import logging
 import asyncio
 import json
 import time
+import numpy as np
 from typing import Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from dateutil import parser
@@ -162,6 +163,49 @@ class Trader:
             posterior = posterior_data['trace']
             
             # ═══════════════════════════════════════════════════════════
+            # 2a. REGIME DETECTION (Cache Invalidation)
+            # ═══════════════════════════════════════════════════════════
+            # IMPORTANT: This is NOT a failure of Bayesian modeling.
+            # In a real-time Bayesian system, the posterior would naturally widen
+            # when surprised by data. However, we cache posteriors for 60s-10min.
+            # 
+            # If a news event occurs, the CACHED model hasn't seen the new data.
+            # This detector invalidates stale caches, forcing re-inference.
+            # 
+            # Future: Replace with online Bayesian updates (particle filters, etc.)
+            
+            try:
+                # Extract inferred signal from last timestep of trace
+                latent_log_odds = posterior.posterior["latent_log_odds"].values
+                inferred_signal_samples = latent_log_odds[:, :, -1].flatten()
+                inferred_signal = np.mean(inferred_signal_samples)
+                inferred_vol = np.std(inferred_signal_samples)
+                
+                # Current market in log-odds space
+                current_logit = self.engine._logit(mid_price)
+                
+                # Deviation in units of σ
+                deviation = abs(current_logit - inferred_signal)
+                sigma_threshold = Config.REGIME_DETECTION_SIGMA_THRESHOLD
+                
+                if deviation > sigma_threshold * inferred_vol:
+                    logger.warning(
+                        f"{ticker}: Cache invalidated - "
+                        f"price moved {deviation/inferred_vol:.1f}σ from cached model "
+                        f"(threshold: {sigma_threshold}σ). Awaiting fresh inference."
+                    )
+                    # Force re-inference on next analyst cycle
+                    async with self.posterior_lock:
+                        if ticker in self.posterior_cache:
+                            del self.posterior_cache[ticker]
+                    return  # Skip this tick
+                    
+            except Exception as e:
+                logger.debug(f"{ticker}: Regime detection failed: {e}")
+                # Don't block trading on regime detection errors
+                pass
+            
+            # ═══════════════════════════════════════════════════════════
             # 3. TIME TO EXPIRY
             # ═══════════════════════════════════════════════════════════
             meta = self.active_markets_meta.get(ticker)
@@ -182,43 +226,65 @@ class Trader:
             fair_value = prediction["fair_value"]
             
             # ═══════════════════════════════════════════════════════════
-            # 5. DECISION LOGIC (Gap vs Actual Executable Prices)
+            # 5. DECISION LOGIC - LIQUIDITY-AWARE EXECUTION
             # ═══════════════════════════════════════════════════════════
-            # BUY Gap: Fair Value must exceed what we PAY (ask price)
-            # SELL Gap: What we RECEIVE (bid price) must exceed fair value
+            # Edge must beat: Spread + Fees + Confidence Buffer
+            #
+            # The critic's insight: Jensen's Gap is often small (cents).
+            # We must ensure the edge exceeds ALL transaction costs.
             
             buy_gap = fair_value - ask_price
             sell_gap = bid_price - fair_value
             
-            edge_threshold_dollars = Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0
+            # Calculate effective costs for BUY side
+            buy_fees = ask_price * Config.TAKER_FEE_RATE
+            buy_spread_cost = spread * Config.CONFIDENCE_MULTIPLIER
+            buy_effective_threshold = (
+                Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0 +
+                buy_fees +
+                buy_spread_cost
+            )
             
-            # BUY signal: Fair value exceeds ask by threshold
-            if buy_gap > edge_threshold_dollars:
+            # Calculate effective costs for SELL side
+            sell_fees = bid_price * Config.TAKER_FEE_RATE
+            sell_spread_cost = spread * Config.CONFIDENCE_MULTIPLIER
+            sell_effective_threshold = (
+                Config.JENSEN_GAP_THRESHOLD_CENTS / 100.0 +
+                sell_fees +
+                sell_spread_cost
+            )
+            
+            # BUY signal: Fair value exceeds ask PLUS all costs
+            if buy_gap > buy_effective_threshold:
+                net_edge = buy_gap - buy_effective_threshold
                 logger.info(
-                    f"BUY {ticker}: BuyGap={buy_gap*100:.2f}¢ "
-                    f"Fair={fair_value:.4f} Ask={ask_price:.4f} "
-                    f"TTE={hours_left:.1f}h"
+                    f"BUY {ticker}: "
+                    f"Gross Gap={buy_gap*100:.2f}¢ "
+                    f"Costs={buy_effective_threshold*100:.2f}¢ (fees={buy_fees*100:.2f}¢, spread={buy_spread_cost*100:.2f}¢) "
+                    f"NET EDGE={net_edge*100:.2f}¢ | "
+                    f"Fair={fair_value:.4f} Ask={ask_price:.4f} TTE={hours_left:.1f}h"
                 )
                 qty = self.order_manager.calculate_kelly_size(
-                    ticker, buy_gap, 1.0, self.order_manager.balance
+                    ticker, net_edge, 1.0, self.order_manager.balance
                 )
                 if qty > 0:
-                    # Convert back to cents for order (API expects integer cents)
                     ask_cents = int(round(ask_price * 100))
                     await self.client.create_order(ticker, "buy", "yes", qty, ask_cents)
             
-            # SELL signal: Bid exceeds fair value by threshold
-            elif sell_gap > edge_threshold_dollars:
+            # SELL signal: Bid exceeds fair value PLUS all costs
+            elif sell_gap > sell_effective_threshold:
+                net_edge = sell_gap - sell_effective_threshold
                 logger.info(
-                    f"SELL {ticker}: SellGap={sell_gap*100:.2f}¢ "
-                    f"Fair={fair_value:.4f} Bid={bid_price:.4f} "
-                    f"TTE={hours_left:.1f}h"
+                    f"SELL {ticker}: "
+                    f"Gross Gap={sell_gap*100:.2f}¢ "
+                    f"Costs={sell_effective_threshold*100:.2f}¢ (fees={sell_fees*100:.2f}¢, spread={sell_spread_cost*100:.2f}¢) "
+                    f"NET EDGE={net_edge*100:.2f}¢ | "
+                    f"Fair={fair_value:.4f} Bid={bid_price:.4f} TTE={hours_left:.1f}h"
                 )
                 qty = self.order_manager.calculate_kelly_size(
-                    ticker, sell_gap, 1.0, self.order_manager.balance
+                    ticker, net_edge, 1.0, self.order_manager.balance
                 )
                 if qty > 0:
-                    # Buy NO at complement price
                     no_price_cents = int(round((1.0 - bid_price) * 100))
                     await self.client.create_order(ticker, "buy", "no", qty, no_price_cents)
 
