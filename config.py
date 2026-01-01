@@ -21,14 +21,26 @@ class Config:
     MIN_DAILY_VOLUME_USD = 1000  # Minimum average daily volume to consider a series
     MIN_HISTORY_EVENTS = 10      # Minimum number of past settled events to calculate volatility
 
-    # Analysis Settings
-    MCMC_N_SIMULATIONS = 2000    # Number of paths
+    # MCMC & Inference Settings
+    MCMC_N_SIMULATIONS = 10000
+    INFERENCE_WINDOW_HOURS = 24 # Lookback for online inference
     MCMC_TUNE_STEPS = 500
     # Clipping removed per user request (logic handles logits naturally, though we clip to avoid -inf/inf at boundaries of 0/1)
     # We keep a tiny epsilon just for safe logit transform if needed locally.
-    MIN_PROBABILITY_CLIP = 0.001 
+    MIN_PROBABILITY_CLIP = 0.001
     MAX_PROBABILITY_CLIP = 0.999
-    JENSEN_GAP_THRESHOLD_CENTS = 0.0 # Logic removed in trader, kept for reference or removed.
+
+    # Trading Thresholds
+    # Jensen's Gap: Difference between Fair Value and Market Price
+    JENSEN_GAP_THRESHOLD_CENTS = 2.0
+
+    # Data & Volatility
+    MIN_VOLATILITY_DATA_POINTS = 50
+    MIN_DAILY_VOLUME_USD = 1000 # Contracts
+
+    # API & Persistence
+    BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+    WS_BASE_URL = "wss://trading-api.kalshi.com/trade-api/v2/ws"
 
     # Trading Settings
     MAX_POSITION_SIZE_PERCENT = 0.05
