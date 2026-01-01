@@ -14,7 +14,7 @@ from series_data import SeriesData
 from analysis_engine import AnalysisEngine  
 from posterior_cache import PosteriorCache
 from trader import OrderManager
-from client import AsyncKalshiClient
+from kalshi_client import AsyncKalshiClient
 import numpy as np
 
 logging.basicConfig(level=logging.INFO)
@@ -28,11 +28,17 @@ async def test_phase2_integration():
     logger.info("PHASE 2 INTEGRATION TEST - Hierarchical Bayesian Architecture")
     logger.info("=" * 80)
     
-    # Initialize client (demo environment)
-    client = AsyncKalshiClient(
-        key_id="YOUR_DEMO_KEY",  # Replace with actual demo key
-        key_file="path/to/key.pem"
-    )
+    # Initialize client from config
+    from config import Config
+    
+    if not Config.KEY_ID or not Config.KEY_FILE:
+        logger.error("KALSHI_KEY_ID and KALSHI_KEY_FILE must be set in environment")
+        return
+    
+    logger.info(f"Using ENV: {Config.ENV.value}")
+    logger.info(f"Using key_id: {Config.KEY_ID[:10]}...")
+    
+    client = AsyncKalshiClient(key_id=Config.KEY_ID, key_file=Config.KEY_FILE)
     
     try:
         # ========================================================================
